@@ -1,6 +1,5 @@
-// ExecDesk — Phase 1 Backend
-// Handles: Auth, Google Calendar sync, AI Advisor, Actions, Goals
-// Deploy this to Render — never expose this file's secrets to the frontend
+// ExecDesk — Phase 1 Backend (Auth Fix)
+// Robust Google OAuth callback that handles all edge cases
 
 const express    = require('express');
 const cors       = require('cors');
@@ -10,42 +9,38 @@ const { google } = require('googleapis');
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
-// ── CLIENTS ──────────────────────────────────────────────────────────────────
+// ── CLIENTS ───────────────────────────────────────────────────────────────────
 const supabase = createClient(
   process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_KEY  // service key — never sent to frontend
+  process.env.SUPABASE_SERVICE_KEY
 );
 
 const oauth2Client = new google.auth.OAuth2(
   process.env.GOOGLE_CLIENT_ID,
   process.env.GOOGLE_CLIENT_SECRET,
-  process.env.GOOGLE_REDIRECT_URI    // e.g. https://execdesk-api.onrender.com/auth/callback
+  process.env.GOOGLE_REDIRECT_URI
 );
 
 // ── MIDDLEWARE ────────────────────────────────────────────────────────────────
 app.use(cors({ origin: '*' }));
 app.use(express.json());
 
-// JWT auth middleware — protects all /api/* routes
 async function requireAuth(req, res, next) {
   const token = req.headers.authorization?.replace('Bearer ', '');
   if (!token) return res.status(401).json({ error: 'No token provided' });
-
   const { data: { user }, error } = await supabase.auth.getUser(token);
   if (error || !user) return res.status(401).json({ error: 'Invalid token' });
-
   req.user = user;
   next();
 }
 
-// ── HEALTH CHECK ─────────────────────────────────────────────────────────────
+// ── HEALTH CHECK ──────────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
-  res.json({ status: 'ExecDesk API running', version: '1.0.0' });
+  res.json({ status: 'ExecDesk API running', version: '1.1.0' });
 });
 
-// ── AUTH: GOOGLE OAUTH ───────────────────────────────────────────────────────
+// ── AUTH ──────────────────────────────────────────────────────────────────────
 
-// Step 1 — App calls this to get the Google login URL
 app.get('/auth/google/url', (req, res) => {
   const url = oauth2Client.generateAuthUrl({
     access_type: 'offline',
@@ -59,48 +54,106 @@ app.get('/auth/google/url', (req, res) => {
   res.json({ url });
 });
 
-// Step 2 — Google redirects here after user approves
+// ── FIXED AUTH CALLBACK ───────────────────────────────────────────────────────
 app.get('/auth/callback', async (req, res) => {
+  const APP_URL = process.env.APP_URL || 'http://localhost';
+
+  // Google may return an error (e.g. user cancelled)
+  if (req.query.error) {
+    console.error('[AUTH] Google returned error:', req.query.error);
+    return res.redirect(`${APP_URL}?error=${encodeURIComponent(req.query.error)}`);
+  }
+
   const { code } = req.query;
-  if (!code) return res.redirect(`${process.env.APP_URL}?error=no_code`);
+  if (!code) {
+    console.error('[AUTH] No code in callback');
+    return res.redirect(`${APP_URL}?error=no_code`);
+  }
 
   try {
-    // Exchange code for tokens
+    // ── Step 1: Exchange code for Google tokens ───────────────────────────────
+    console.log('[AUTH] Exchanging code for tokens...');
     const { tokens } = await oauth2Client.getToken(code);
     oauth2Client.setCredentials(tokens);
+    console.log('[AUTH] Got Google tokens. Has refresh token:', !!tokens.refresh_token);
 
-    // Get user profile from Google
-    const oauth2 = google.oauth2({ version: 'v2', auth: oauth2Client });
-    const { data: profile } = await oauth2.userinfo.get();
+    // ── Step 2: Get Google profile ────────────────────────────────────────────
+    console.log('[AUTH] Fetching Google profile...');
+    const oauth2Api = google.oauth2({ version: 'v2', auth: oauth2Client });
+    const { data: profile } = await oauth2Api.userinfo.get();
+    console.log('[AUTH] Profile fetched:', profile.email);
 
-    // Sign in or create user in Supabase Auth
-    const { data: authData, error: authError } = await supabase.auth.signInWithPassword({
+    // ── Step 3: Get or create Supabase user ───────────────────────────────────
+    const password = (process.env.SUPABASE_USERS_SECRET || 'default-secret') + profile.id;
+
+    // First try signing in (user already exists)
+    let session = null;
+    console.log('[AUTH] Trying sign in...');
+    const { data: signinData, error: signinError } = await supabase.auth.signInWithPassword({
       email: profile.email,
-      password: process.env.SUPABASE_USERS_SECRET + profile.id // deterministic password
-    }).catch(() => ({ data: null, error: 'not_found' }));
+      password
+    });
 
-    let session;
-    if (!authData?.session) {
-      // User doesn't exist — create them
-      const { data: signupData, error: signupError } = await supabase.auth.admin.createUser({
-        email: profile.email,
-        password: process.env.SUPABASE_USERS_SECRET + profile.id,
-        email_confirm: true,
-        user_metadata: { name: profile.name, avatar: profile.picture, google_id: profile.id }
-      });
-      if (signupError) throw signupError;
-
-      const { data: signinData } = await supabase.auth.signInWithPassword({
-        email: profile.email,
-        password: process.env.SUPABASE_USERS_SECRET + profile.id
-      });
-      session = signinData?.session;
+    if (signinData?.session) {
+      // Existing user — signed in successfully
+      session = signinData.session;
+      console.log('[AUTH] Existing user signed in successfully');
     } else {
-      session = authData.session;
+      // User not found — create them
+      console.log('[AUTH] Sign in failed:', signinError?.message, '— creating new user...');
+
+      const { data: createData, error: createError } = await supabase.auth.admin.createUser({
+        email: profile.email,
+        password,
+        email_confirm: true,
+        user_metadata: {
+          name: profile.name,
+          avatar_url: profile.picture,
+          google_id: profile.id
+        }
+      });
+
+      if (createError) {
+        // User may already exist with different state — try sign in one more time
+        if (createError.message?.includes('already been registered') || createError.message?.includes('already exists')) {
+          console.log('[AUTH] User already exists, retrying sign in...');
+          const { data: retryData, error: retryError } = await supabase.auth.signInWithPassword({
+            email: profile.email, password
+          });
+          if (retryData?.session) {
+            session = retryData.session;
+            console.log('[AUTH] Retry sign in succeeded');
+          } else {
+            console.error('[AUTH] Retry sign in failed:', retryError?.message);
+            throw new Error('Could not sign in: ' + (retryError?.message || 'unknown error'));
+          }
+        } else {
+          console.error('[AUTH] Create user failed:', createError.message);
+          throw new Error('Could not create user: ' + createError.message);
+        }
+      } else {
+        // New user created — now sign in
+        console.log('[AUTH] New user created:', createData?.user?.id);
+        const { data: newSignin, error: newSigninError } = await supabase.auth.signInWithPassword({
+          email: profile.email, password
+        });
+        if (newSignin?.session) {
+          session = newSignin.session;
+          console.log('[AUTH] New user signed in successfully');
+        } else {
+          console.error('[AUTH] New user sign in failed:', newSigninError?.message);
+          throw new Error('Could not sign in new user: ' + (newSigninError?.message || 'no session'));
+        }
+      }
     }
 
-    // Upsert user profile + store Google tokens in DB
-    await supabase.from('users').upsert({
+    if (!session) {
+      throw new Error('No session obtained after auth flow');
+    }
+
+    // ── Step 4: Save/update user profile + Google tokens in DB ───────────────
+    console.log('[AUTH] Saving user profile to DB...');
+    const { error: upsertError } = await supabase.from('users').upsert({
       id: session.user.id,
       email: profile.email,
       name: profile.name,
@@ -111,77 +164,118 @@ app.get('/auth/callback', async (req, res) => {
       updated_at: new Date().toISOString()
     }, { onConflict: 'id' });
 
-    // Kick off first calendar sync in background
-    syncCalendarForUser(session.user.id, tokens).catch(console.error);
+    if (upsertError) {
+      // Non-fatal — log it but continue
+      console.warn('[AUTH] Profile upsert warning:', upsertError.message);
+    }
 
-    // Redirect back to app with session token
-    res.redirect(`${process.env.APP_URL}?token=${session.access_token}&refresh=${session.refresh_token}`);
+    // ── Step 5: Kick off calendar sync in background ──────────────────────────
+    console.log('[AUTH] Starting background calendar sync...');
+    syncCalendarForUser(session.user.id, tokens).catch(e =>
+      console.warn('[AUTH] Background sync warning:', e.message)
+    );
+
+    // ── Step 6: Redirect to app with tokens ───────────────────────────────────
+    const redirectUrl = `${APP_URL}?token=${encodeURIComponent(session.access_token)}&refresh=${encodeURIComponent(session.refresh_token)}`;
+    console.log('[AUTH] Redirecting to app. Token length:', session.access_token?.length);
+    return res.redirect(redirectUrl);
 
   } catch (err) {
-    console.error('Auth callback error:', err);
-    res.redirect(`${process.env.APP_URL}?error=auth_failed`);
+    console.error('[AUTH] Fatal error in callback:', err.message);
+    return res.redirect(`${APP_URL}?error=${encodeURIComponent(err.message)}`);
   }
 });
 
-// Refresh a Supabase session token
+// Refresh session
 app.post('/auth/refresh', async (req, res) => {
   const { refresh_token } = req.body;
   if (!refresh_token) return res.status(400).json({ error: 'refresh_token required' });
-
   const { data, error } = await supabase.auth.refreshSession({ refresh_token });
   if (error) return res.status(401).json({ error: 'Session expired. Please log in again.' });
-
   res.json({ token: data.session.access_token, refresh: data.session.refresh_token });
 });
 
-// Get current user profile
+// Get current user
 app.get('/auth/me', requireAuth, async (req, res) => {
   const { data, error } = await supabase
     .from('users')
     .select('id, email, name, avatar_url, timezone, role_title, subscription_tier')
     .eq('id', req.user.id)
     .single();
-
-  if (error) return res.status(404).json({ error: 'User not found' });
+  if (error) {
+    // User row may not exist yet (race condition) — return basic info from JWT
+    return res.json({
+      id: req.user.id,
+      email: req.user.email,
+      name: req.user.user_metadata?.name || req.user.email,
+      avatar_url: req.user.user_metadata?.avatar_url || null,
+      timezone: 'America/New_York',
+      role_title: 'CEO',
+      subscription_tier: 'free'
+    });
+  }
   res.json(data);
 });
 
-// ── CALENDAR ─────────────────────────────────────────────────────────────────
+// ── CALENDAR ──────────────────────────────────────────────────────────────────
 
-// Helper: sync a user's Google Calendar events to Supabase cache
+async function getAuthClient(userId) {
+  const { data: user, error } = await supabase
+    .from('users')
+    .select('google_access_token, google_refresh_token, google_token_expiry')
+    .eq('id', userId)
+    .single();
+
+  if (error || !user?.google_refresh_token) {
+    throw new Error('No Google tokens found. Please reconnect your calendar.');
+  }
+
+  const client = new google.auth.OAuth2(
+    process.env.GOOGLE_CLIENT_ID,
+    process.env.GOOGLE_CLIENT_SECRET,
+    process.env.GOOGLE_REDIRECT_URI
+  );
+
+  client.setCredentials({
+    access_token: user.google_access_token,
+    refresh_token: user.google_refresh_token,
+    expiry_date: user.google_token_expiry
+  });
+
+  // Auto-refresh if token is expired or expiring in next 60 seconds
+  if (user.google_token_expiry && Date.now() > user.google_token_expiry - 60000) {
+    try {
+      const { credentials } = await client.refreshAccessToken();
+      await supabase.from('users').update({
+        google_access_token: credentials.access_token,
+        google_token_expiry: credentials.expiry_date
+      }).eq('id', userId);
+      client.setCredentials(credentials);
+      console.log('[CALENDAR] Token refreshed for user:', userId);
+    } catch (e) {
+      console.warn('[CALENDAR] Token refresh failed:', e.message);
+    }
+  }
+
+  return client;
+}
+
 async function syncCalendarForUser(userId, tokens) {
-  // Get fresh tokens from DB if not provided
-  if (!tokens) {
-    const { data: user } = await supabase
-      .from('users')
-      .select('google_access_token, google_refresh_token, google_token_expiry')
-      .eq('id', userId)
-      .single();
-    if (!user?.google_refresh_token) return;
-    tokens = {
-      access_token: user.google_access_token,
-      refresh_token: user.google_refresh_token,
-      expiry_date: user.google_token_expiry
-    };
+  let authClient;
+  if (tokens) {
+    authClient = new google.auth.OAuth2(
+      process.env.GOOGLE_CLIENT_ID,
+      process.env.GOOGLE_CLIENT_SECRET,
+      process.env.GOOGLE_REDIRECT_URI
+    );
+    authClient.setCredentials(tokens);
+  } else {
+    authClient = await getAuthClient(userId);
   }
 
-  oauth2Client.setCredentials(tokens);
-
-  // Auto-refresh if expired
-  if (tokens.expiry_date && Date.now() > tokens.expiry_date - 60000) {
-    const { credentials } = await oauth2Client.refreshAccessToken();
-    await supabase.from('users').update({
-      google_access_token: credentials.access_token,
-      google_token_expiry: credentials.expiry_date
-    }).eq('id', userId);
-    oauth2Client.setCredentials(credentials);
-  }
-
-  const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
-
-  // Fetch events from now to 14 days ahead
-  const now  = new Date();
-  const end  = new Date(now.getTime() + 14 * 24 * 60 * 60 * 1000);
+  const calendar = google.calendar({ version: 'v3', auth: authClient });
+  const now = new Date();
+  const end = new Date(now.getTime() + 14 * 24 * 60 * 60 * 1000);
 
   const { data } = await calendar.events.list({
     calendarId: 'primary',
@@ -192,55 +286,45 @@ async function syncCalendarForUser(userId, tokens) {
     orderBy: 'startTime'
   });
 
+  const travelKeywords = ['flight', 'hotel', 'travel', 'airport', 'train', 'airbnb', 'check-in', 'check in', 'fly', 'depart', 'arrive', 'layover', 'uber', 'lyft', 'taxi'];
+
   const events = (data.items || []).map(ev => {
     const title = ev.summary || '(No title)';
-    // Travel detection: scan title and description for keywords
-    const travelKeywords = ['flight', 'hotel', 'travel', 'airport', 'train', 'transit', 'airbnb', 'check-in', 'check in', 'fly', 'depart', 'arrive', 'layover'];
-    const isTravel = travelKeywords.some(k => (title + (ev.description||'')).toLowerCase().includes(k));
-    const attendees = (ev.attendees || []).map(a => ({ name: a.displayName || a.email, email: a.email }));
-    const hasConference = !!(ev.conferenceData || ev.hangoutLink || (ev.description||'').match(/zoom\.us|teams\.microsoft|meet\.google/i));
+    const desc  = ev.description || '';
+    const isTravel   = travelKeywords.some(k => (title + desc).toLowerCase().includes(k));
+    const isVirtual  = !!(ev.conferenceData || ev.hangoutLink || desc.match(/zoom\.us|teams\.microsoft|meet\.google/i));
+    const attendees  = (ev.attendees || []).map(a => ({ name: a.displayName || a.email, email: a.email }));
 
     return {
       user_id: userId,
       google_event_id: ev.id,
       title,
-      description: ev.description || null,
+      description: desc || null,
       start_time: ev.start?.dateTime || ev.start?.date,
-      end_time: ev.end?.dateTime || ev.end?.date,
-      location: ev.location || null,
+      end_time:   ev.end?.dateTime   || ev.end?.date,
+      location:   ev.location || null,
       attendees,
       meeting_link: ev.hangoutLink || ev.conferenceData?.entryPoints?.[0]?.uri || null,
-      is_all_day: !!ev.start?.date,
-      is_travel: isTravel,
-      is_virtual: hasConference,
-      status: ev.status,
-      updated_at: new Date().toISOString()
+      is_all_day:  !!ev.start?.date,
+      is_travel:   isTravel,
+      is_virtual:  isVirtual,
+      status:      ev.status,
+      updated_at:  new Date().toISOString()
     };
   });
 
-  // Upsert all events (insert or update by google_event_id)
   if (events.length > 0) {
-    await supabase.from('calendar_events')
+    const { error } = await supabase.from('calendar_events')
       .upsert(events, { onConflict: 'user_id,google_event_id' });
+    if (error) console.error('[CALENDAR] Upsert error:', error.message);
   }
 
-  // Delete cached events that no longer exist in Google Calendar
-  const googleIds = events.map(e => e.google_event_id);
-  if (googleIds.length > 0) {
-    await supabase.from('calendar_events')
-      .delete()
-      .eq('user_id', userId)
-      .gte('start_time', now.toISOString())
-      .not('google_event_id', 'in', `(${googleIds.map(id => `"${id}"`).join(',')})`);
-  }
-
+  console.log(`[CALENDAR] Synced ${events.length} events for user ${userId}`);
   return events;
 }
 
-// GET today's events
 app.get('/api/calendar/today', requireAuth, async (req, res) => {
-  // Trigger a background sync first
-  syncCalendarForUser(req.user.id).catch(console.error);
+  syncCalendarForUser(req.user.id).catch(e => console.warn('[SYNC]', e.message));
 
   const todayStart = new Date(); todayStart.setHours(0,0,0,0);
   const todayEnd   = new Date(); todayEnd.setHours(23,59,59,999);
@@ -257,7 +341,6 @@ app.get('/api/calendar/today', requireAuth, async (req, res) => {
   res.json({ events: data || [], synced_at: new Date().toISOString() });
 });
 
-// GET week ahead events
 app.get('/api/calendar/week', requireAuth, async (req, res) => {
   const start = new Date(); start.setHours(0,0,0,0);
   const end   = new Date(start.getTime() + 7 * 24 * 60 * 60 * 1000);
@@ -272,7 +355,6 @@ app.get('/api/calendar/week', requireAuth, async (req, res) => {
 
   if (error) return res.status(500).json({ error: error.message });
 
-  // Group by day and detect overload (4+ meetings in a day)
   const byDay = {};
   (data || []).forEach(ev => {
     const day = ev.start_time.slice(0, 10);
@@ -291,7 +373,6 @@ app.get('/api/calendar/week', requireAuth, async (req, res) => {
   res.json({ days, total_events: data?.length || 0 });
 });
 
-// GET travel events (next 30 days)
 app.get('/api/calendar/travel', requireAuth, async (req, res) => {
   const start = new Date();
   const end   = new Date(start.getTime() + 30 * 24 * 60 * 60 * 1000);
@@ -309,7 +390,6 @@ app.get('/api/calendar/travel', requireAuth, async (req, res) => {
   res.json({ travel: data || [] });
 });
 
-// Force sync (user taps refresh button)
 app.post('/api/calendar/sync', requireAuth, async (req, res) => {
   try {
     const events = await syncCalendarForUser(req.user.id);
@@ -320,12 +400,10 @@ app.post('/api/calendar/sync', requireAuth, async (req, res) => {
 });
 
 // ── AI ADVISOR ────────────────────────────────────────────────────────────────
-
 app.post('/api/chat', requireAuth, async (req, res) => {
   const { message } = req.body;
   if (!message) return res.status(400).json({ error: 'message required' });
 
-  // Build rich context from user's real data
   const todayStart = new Date(); todayStart.setHours(0,0,0,0);
   const todayEnd   = new Date(); todayEnd.setHours(23,59,59,999);
   const weekEnd    = new Date(todayStart.getTime() + 7 * 24 * 60 * 60 * 1000);
@@ -339,80 +417,64 @@ app.post('/api/chat', requireAuth, async (req, res) => {
     supabase.from('ai_conversations').select('role, content').eq('user_id', req.user.id).order('created_at', { ascending: false }).limit(10)
   ]);
 
-  const user = userRes.data;
-  const todayEvents = todayRes.data || [];
-  const weekEvents  = weekRes.data  || [];
-  const actions     = actionsRes.data || [];
-  const goals       = goalsRes.data || [];
-  const history     = (historyRes.data || []).reverse();
+  const user       = userRes.data || {};
+  const todayEvs   = todayRes.data || [];
+  const weekEvs    = weekRes.data  || [];
+  const actions    = actionsRes.data || [];
+  const goals      = goalsRes.data   || [];
+  const history    = (historyRes.data || []).reverse();
 
-  const todaySummary = todayEvents.map(e => `${new Date(e.start_time).toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit'})} - ${e.title}${e.is_travel?' (TRAVEL)':''}`).join('\n') || 'No meetings today';
-  const actionSummary = actions.slice(0,5).map(a => `- ${a.title} (due: ${a.due_date || 'no date'}${a.delegated_to ? ', delegated to '+a.delegated_to : ''})`).join('\n') || 'No open action items';
-  const goalSummary = goals.map(g => `- ${g.title}: ${g.progress_pct}%`).join('\n') || 'No goals set';
-  const overloadDays = weekEvents.reduce((acc, e) => { const d = e.start_time.slice(0,10); acc[d] = (acc[d]||0)+1; return acc; }, {});
-  const busyDays = Object.entries(overloadDays).filter(([,c]) => c >= 4).map(([d]) => d).join(', ') || 'none';
+  const fmt = iso => new Date(iso).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
 
-  const context = `
-Executive: ${user?.name || 'User'} — ${user?.role_title || 'CEO/Executive'}
+  const todaySummary  = todayEvs.map(e => `  ${fmt(e.start_time)} - ${e.title}${e.is_travel ? ' [TRAVEL]' : ''}`).join('\n') || '  No meetings today';
+  const actionSummary = actions.slice(0,5).map(a => `  - ${a.title} (due: ${a.due_date || 'no date'}${a.delegated_to ? ', delegated to ' + a.delegated_to : ''})`).join('\n') || '  No open actions';
+  const goalSummary   = goals.map(g => `  - ${g.title}: ${g.progress_pct}%`).join('\n') || '  No goals set';
+  const overloadDays  = Object.entries(weekEvs.reduce((a,e) => { const d=e.start_time.slice(0,10); a[d]=(a[d]||0)+1; return a; }, {})).filter(([,c])=>c>=4).map(([d])=>d).join(', ') || 'none';
+
+  const context = `Executive: ${user.name || req.user.email} — ${user.role_title || 'CEO/Executive'}
 Today (${new Date().toDateString()}):
 ${todaySummary}
 
-Open actions (top 5):
+Open action items:
 ${actionSummary}
 
-Goals & progress:
+Goals & OKR progress:
 ${goalSummary}
 
-Overloaded days this week (4+ meetings): ${busyDays}
-Travel events this week: ${weekEvents.filter(e=>e.is_travel).map(e=>e.title).join(', ') || 'none'}
-`.trim();
+Overloaded days this week (4+ meetings): ${overloadDays}
+Travel events detected: ${weekEvs.filter(e=>e.is_travel).map(e=>e.title).join(', ') || 'none'}`;
 
-  // Save user message to history
   await supabase.from('ai_conversations').insert({ user_id: req.user.id, role: 'user', content: message });
 
-  // Build conversation history for Claude
   const messages = [
     ...history.map(h => ({ role: h.role, content: h.content })),
     { role: 'user', content: message }
   ];
 
   try {
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': process.env.ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01'
-      },
+      headers: { 'Content-Type': 'application/json', 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
       body: JSON.stringify({
         model: 'claude-sonnet-4-20250514',
         max_tokens: 1000,
-        system: `You are an elite executive advisor and chief of staff. Be direct, concise, and actionable. No filler. Give specific, data-driven recommendations based on the executive's real schedule. For well-being topics, be empathetic but practical. Here is the executive's current context:\n\n${context}`,
+        system: `You are an elite executive advisor and chief of staff. Be direct, concise, and actionable. No filler. Use the executive's real schedule data to give specific recommendations. Context:\n\n${context}`,
         messages
       })
     });
-
-    const data = await response.json();
-    const reply = data.content?.[0]?.text || 'Unable to respond right now. Please try again.';
-
-    // Save AI reply to history
+    const data  = await r.json();
+    const reply = data.content?.[0]?.text || 'Unable to respond right now.';
     await supabase.from('ai_conversations').insert({ user_id: req.user.id, role: 'assistant', content: reply });
-
     res.json({ reply });
   } catch (err) {
-    console.error('AI error:', err);
+    console.error('[AI] Error:', err.message);
     res.status(500).json({ error: 'AI service unavailable' });
   }
 });
 
-// ── ACTION ITEMS ──────────────────────────────────────────────────────────────
-
+// ── ACTIONS ───────────────────────────────────────────────────────────────────
 app.get('/api/actions', requireAuth, async (req, res) => {
-  const { data, error } = await supabase
-    .from('action_items')
-    .select('*')
-    .eq('user_id', req.user.id)
-    .order('due_date', { ascending: true, nullsLast: true });
+  const { data, error } = await supabase.from('action_items').select('*').eq('user_id', req.user.id).order('due_date', { ascending: true, nullsLast: true });
   if (error) return res.status(500).json({ error: error.message });
   res.json({ actions: data || [] });
 });
@@ -420,26 +482,15 @@ app.get('/api/actions', requireAuth, async (req, res) => {
 app.post('/api/actions', requireAuth, async (req, res) => {
   const { title, due_date, delegated_to, priority } = req.body;
   if (!title) return res.status(400).json({ error: 'title required' });
-
-  const { data, error } = await supabase.from('action_items').insert({
-    user_id: req.user.id, title, due_date: due_date || null,
-    delegated_to: delegated_to || null, priority: priority || 'medium', status: 'pending'
-  }).select().single();
-
+  const { data, error } = await supabase.from('action_items').insert({ user_id: req.user.id, title, due_date: due_date || null, delegated_to: delegated_to || null, priority: priority || 'medium', status: 'pending' }).select().single();
   if (error) return res.status(500).json({ error: error.message });
   res.json({ action: data });
 });
 
 app.patch('/api/actions/:id', requireAuth, async (req, res) => {
-  const { status, title, due_date } = req.body;
-  const updates = {};
-  if (status !== undefined) updates.status = status;
-  if (title  !== undefined) updates.title  = title;
-  if (due_date !== undefined) updates.due_date = due_date;
-  updates.updated_at = new Date().toISOString();
-
-  const { data, error } = await supabase.from('action_items')
-    .update(updates).eq('id', req.params.id).eq('user_id', req.user.id).select().single();
+  const updates = { updated_at: new Date().toISOString() };
+  ['status','title','due_date'].forEach(k => { if (req.body[k] !== undefined) updates[k] = req.body[k]; });
+  const { data, error } = await supabase.from('action_items').update(updates).eq('id', req.params.id).eq('user_id', req.user.id).select().single();
   if (error) return res.status(500).json({ error: error.message });
   res.json({ action: data });
 });
@@ -450,10 +501,8 @@ app.delete('/api/actions/:id', requireAuth, async (req, res) => {
 });
 
 // ── GOALS ─────────────────────────────────────────────────────────────────────
-
 app.get('/api/goals', requireAuth, async (req, res) => {
-  const { data, error } = await supabase
-    .from('goals').select('*').eq('user_id', req.user.id).order('created_at');
+  const { data, error } = await supabase.from('goals').select('*').eq('user_id', req.user.id).order('created_at');
   if (error) return res.status(500).json({ error: error.message });
   res.json({ goals: data || [] });
 });
@@ -461,36 +510,24 @@ app.get('/api/goals', requireAuth, async (req, res) => {
 app.post('/api/goals', requireAuth, async (req, res) => {
   const { title, target_date, progress_pct, notes } = req.body;
   if (!title) return res.status(400).json({ error: 'title required' });
-  const { data, error } = await supabase.from('goals').insert({
-    user_id: req.user.id, title, target_date: target_date || null,
-    progress_pct: progress_pct || 0, notes: notes || null
-  }).select().single();
+  const { data, error } = await supabase.from('goals').insert({ user_id: req.user.id, title, target_date: target_date || null, progress_pct: progress_pct || 0, notes: notes || null }).select().single();
   if (error) return res.status(500).json({ error: error.message });
   res.json({ goal: data });
 });
 
 app.patch('/api/goals/:id', requireAuth, async (req, res) => {
-  const { progress_pct, title, notes } = req.body;
   const updates = { updated_at: new Date().toISOString() };
-  if (progress_pct !== undefined) updates.progress_pct = progress_pct;
-  if (title !== undefined) updates.title = title;
-  if (notes !== undefined) updates.notes = notes;
-  const { data, error } = await supabase.from('goals')
-    .update(updates).eq('id', req.params.id).eq('user_id', req.user.id).select().single();
+  ['progress_pct','title','notes'].forEach(k => { if (req.body[k] !== undefined) updates[k] = req.body[k]; });
+  const { data, error } = await supabase.from('goals').update(updates).eq('id', req.params.id).eq('user_id', req.user.id).select().single();
   if (error) return res.status(500).json({ error: error.message });
   res.json({ goal: data });
 });
 
-// ── USER SETTINGS ─────────────────────────────────────────────────────────────
-
+// ── SETTINGS ──────────────────────────────────────────────────────────────────
 app.patch('/api/settings', requireAuth, async (req, res) => {
-  const { role_title, timezone, name } = req.body;
   const updates = { updated_at: new Date().toISOString() };
-  if (role_title !== undefined) updates.role_title = role_title;
-  if (timezone   !== undefined) updates.timezone   = timezone;
-  if (name       !== undefined) updates.name       = name;
-  const { data, error } = await supabase.from('users')
-    .update(updates).eq('id', req.user.id).select().single();
+  ['role_title','timezone','name'].forEach(k => { if (req.body[k] !== undefined) updates[k] = req.body[k]; });
+  const { data, error } = await supabase.from('users').update(updates).eq('id', req.user.id).select().single();
   if (error) return res.status(500).json({ error: error.message });
   res.json({ user: data });
 });
