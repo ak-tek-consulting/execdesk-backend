@@ -318,6 +318,277 @@ app.post('/api/calendar/sync', requireAuth, async (req, res) => {
     res.status(500).json({ error: 'Sync failed: ' + err.message });
   }
 });
+// ─────────────────────────────────────────────────────────────────────────────
+// PAST MEETINGS — Add these routes to your existing server.js
+// Paste them right after the /api/calendar/sync route (around line 400)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── FETCH PAST EVENTS FROM GOOGLE CALENDAR ────────────────────────────────────
+// Fetches historical events, caches them in Supabase, returns them.
+// Accepts: ?start=YYYY-MM-DD&end=YYYY-MM-DD (both required)
+// Max range: 90 days to avoid quota issues
+
+app.get('/api/calendar/history', requireAuth, async (req, res) => {
+  const { start, end } = req.query;
+
+  if (!start || !end) {
+    return res.status(400).json({ error: 'start and end query params required (YYYY-MM-DD)' });
+  }
+
+  const startDate = new Date(start);
+  const endDate   = new Date(end);
+  endDate.setHours(23, 59, 59, 999);
+
+  // Cap range at 90 days to avoid Google API quota issues
+  const diffDays = (endDate - startDate) / (1000 * 60 * 60 * 24);
+  if (diffDays > 90) {
+    return res.status(400).json({ error: 'Date range cannot exceed 90 days' });
+  }
+  if (startDate > new Date()) {
+    return res.status(400).json({ error: 'start date must be in the past' });
+  }
+
+  try {
+    // First check Supabase cache for this range
+    const { data: cached } = await supabase
+      .from('calendar_events')
+      .select('*')
+      .eq('user_id', req.user.id)
+      .gte('start_time', startDate.toISOString())
+      .lte('start_time', endDate.toISOString())
+      .order('start_time', { ascending: true });
+
+    // If we have cached data and it's reasonably complete, return it
+    // (We consider cache valid if there are any events — historical events don't change)
+    if (cached && cached.length > 0) {
+      console.log(`[HISTORY] Returning ${cached.length} cached events for ${start} → ${end}`);
+      return res.json({
+        events: cached,
+        source: 'cache',
+        total: cached.length
+      });
+    }
+
+    // No cache — fetch from Google Calendar API
+    console.log(`[HISTORY] Fetching from Google Calendar API: ${start} → ${end}`);
+
+    const authClient = await getAuthClient(req.user.id);
+    const calendar   = google.calendar({ version: 'v3', auth: authClient });
+
+    const { data } = await calendar.events.list({
+      calendarId:   'primary',
+      timeMin:      startDate.toISOString(),
+      timeMax:      endDate.toISOString(),
+      maxResults:   500,
+      singleEvents: true,
+      orderBy:      'startTime'
+    });
+
+    const travelKeywords = ['flight','hotel','travel','airport','train','airbnb','check-in','check in','fly','depart','arrive','layover'];
+
+    const events = (data.items || []).map(ev => {
+      const title = ev.summary || '(No title)';
+      const desc  = ev.description || '';
+      const isTravel  = travelKeywords.some(k => (title + desc).toLowerCase().includes(k));
+      const isVirtual = !!(ev.conferenceData || ev.hangoutLink || desc.match(/zoom\.us|teams\.microsoft|meet\.google/i));
+      const attendees = (ev.attendees || []).map(a => ({ name: a.displayName || a.email, email: a.email }));
+
+      return {
+        user_id:        req.user.id,
+        google_event_id: ev.id,
+        title,
+        description:    desc || null,
+        start_time:     ev.start?.dateTime || ev.start?.date,
+        end_time:       ev.end?.dateTime   || ev.end?.date,
+        location:       ev.location || null,
+        attendees,
+        meeting_link:   ev.hangoutLink || ev.conferenceData?.entryPoints?.[0]?.uri || null,
+        is_all_day:     !!ev.start?.date,
+        is_travel:      isTravel,
+        is_virtual:     isVirtual,
+        status:         ev.status,
+        updated_at:     new Date().toISOString()
+      };
+    });
+
+    // Cache the results in Supabase for future requests
+    if (events.length > 0) {
+      const { error: upsertError } = await supabase
+        .from('calendar_events')
+        .upsert(events, { onConflict: 'user_id,google_event_id' });
+
+      if (upsertError) {
+        console.warn('[HISTORY] Cache upsert warning:', upsertError.message);
+      }
+    }
+
+    console.log(`[HISTORY] Fetched and cached ${events.length} events`);
+    res.json({ events, source: 'google', total: events.length });
+
+  } catch (err) {
+    console.error('[HISTORY] Error:', err.message);
+
+    // If Google API fails, try returning whatever is in cache as fallback
+    const { data: fallback } = await supabase
+      .from('calendar_events')
+      .select('*')
+      .eq('user_id', req.user.id)
+      .gte('start_time', startDate.toISOString())
+      .lte('start_time', endDate.toISOString())
+      .order('start_time', { ascending: true });
+
+    if (fallback && fallback.length > 0) {
+      return res.json({ events: fallback, source: 'cache_fallback', total: fallback.length });
+    }
+
+    res.status(500).json({ error: 'Could not fetch history: ' + err.message });
+  }
+});
+
+
+// ── SEARCH PAST MEETINGS ──────────────────────────────────────────────────────
+// Full-text search across cached events (title, description, attendees)
+// Accepts: ?q=search+term&limit=50
+
+app.get('/api/calendar/search', requireAuth, async (req, res) => {
+  const { q, limit = 50 } = req.query;
+
+  if (!q || q.trim().length < 2) {
+    return res.status(400).json({ error: 'Search query must be at least 2 characters' });
+  }
+
+  const searchTerm = q.trim().toLowerCase();
+
+  try {
+    // Search in title and description using Supabase ilike (case-insensitive)
+    // We search across all cached events (both past and future)
+    const { data: byTitle, error: e1 } = await supabase
+      .from('calendar_events')
+      .select('*')
+      .eq('user_id', req.user.id)
+      .ilike('title', `%${searchTerm}%`)
+      .order('start_time', { ascending: false })
+      .limit(parseInt(limit));
+
+    const { data: byDesc } = await supabase
+      .from('calendar_events')
+      .select('*')
+      .eq('user_id', req.user.id)
+      .ilike('description', `%${searchTerm}%`)
+      .order('start_time', { ascending: false })
+      .limit(20);
+
+    if (e1) return res.status(500).json({ error: e1.message });
+
+    // Merge and deduplicate results
+    const seen = new Set();
+    const merged = [...(byTitle || []), ...(byDesc || [])]
+      .filter(ev => {
+        if (seen.has(ev.id)) return false;
+        seen.add(ev.id);
+        return true;
+      })
+      .sort((a, b) => new Date(b.start_time) - new Date(a.start_time))
+      .slice(0, parseInt(limit));
+
+    // Also search attendee names (in memory since JSONB search varies)
+    const allCached = await supabase
+      .from('calendar_events')
+      .select('*')
+      .eq('user_id', req.user.id)
+      .order('start_time', { ascending: false })
+      .limit(500);
+
+    const attendeeMatches = (allCached.data || []).filter(ev => {
+      if (seen.has(ev.id)) return false;
+      const attendeeStr = JSON.stringify(ev.attendees || '').toLowerCase();
+      return attendeeStr.includes(searchTerm);
+    }).slice(0, 20);
+
+    attendeeMatches.forEach(ev => seen.add(ev.id));
+
+    const results = [...merged, ...attendeeMatches]
+      .sort((a, b) => new Date(b.start_time) - new Date(a.start_time))
+      .slice(0, parseInt(limit));
+
+    console.log(`[SEARCH] "${searchTerm}" → ${results.length} results`);
+    res.json({ results, query: q, total: results.length });
+
+  } catch (err) {
+    console.error('[SEARCH] Error:', err.message);
+    res.status(500).json({ error: 'Search failed: ' + err.message });
+  }
+});
+
+
+// ── SINGLE EVENT DETAIL ───────────────────────────────────────────────────────
+// Fetch full details of a single cached event by its google_event_id
+// Used when user clicks a meeting to see full details
+
+app.get('/api/calendar/event/:eventId', requireAuth, async (req, res) => {
+  const { data, error } = await supabase
+    .from('calendar_events')
+    .select('*')
+    .eq('user_id', req.user.id)
+    .eq('google_event_id', req.params.eventId)
+    .single();
+
+  if (error || !data) {
+    return res.status(404).json({ error: 'Event not found' });
+  }
+  res.json({ event: data });
+});
+
+
+// ── MONTH SUMMARY ─────────────────────────────────────────────────────────────
+// Returns aggregated stats for a given month
+// Accepts: ?year=2026&month=3 (1-indexed month)
+
+app.get('/api/calendar/month-summary', requireAuth, async (req, res) => {
+  const year  = parseInt(req.query.year  || new Date().getFullYear());
+  const month = parseInt(req.query.month || new Date().getMonth() + 1);
+
+  const start = new Date(year, month - 1, 1);
+  const end   = new Date(year, month, 0, 23, 59, 59, 999); // last day of month
+
+  const { data, error } = await supabase
+    .from('calendar_events')
+    .select('title, start_time, end_time, is_all_day, is_travel, is_virtual, attendees')
+    .eq('user_id', req.user.id)
+    .gte('start_time', start.toISOString())
+    .lte('start_time', end.toISOString())
+    .order('start_time', { ascending: true });
+
+  if (error) return res.status(500).json({ error: error.message });
+
+  const events = data || [];
+  const meetings = events.filter(e => !e.is_all_day && !e.is_travel);
+  const travel   = events.filter(e => e.is_travel);
+  const totalMin = meetings.reduce((a, e) => a + (new Date(e.end_time) - new Date(e.start_time)) / 60000, 0);
+
+  // Unique attendees
+  const attendeeSet = new Set();
+  meetings.forEach(e => (e.attendees || []).forEach(a => a.email && attendeeSet.add(a.email)));
+
+  // Busiest day
+  const byDay = {};
+  meetings.forEach(e => {
+    const d = e.start_time.slice(0, 10);
+    byDay[d] = (byDay[d] || 0) + 1;
+  });
+  const busiestDay = Object.entries(byDay).sort(([,a],[,b]) => b - a)[0];
+
+  res.json({
+    month: `${year}-${String(month).padStart(2,'0')}`,
+    total_events: events.length,
+    total_meetings: meetings.length,
+    total_travel: travel.length,
+    total_meeting_hours: Math.round(totalMin / 60 * 10) / 10,
+    unique_attendees: attendeeSet.size,
+    busiest_day: busiestDay ? { date: busiestDay[0], count: busiestDay[1] } : null,
+    virtual_meetings: meetings.filter(e => e.is_virtual).length
+  });
+});
 
 // ── AI ADVISOR ────────────────────────────────────────────────────────────────
 
