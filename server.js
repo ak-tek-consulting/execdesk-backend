@@ -1,536 +1,940 @@
-// ExecDesk — Phase 1 Backend (Auth Fix)
-// Robust Google OAuth callback that handles all edge cases
+// ═══════════════════════════════════════════════════════════════════════════
+// ExecDesk v4 — Backend Additions
+// Add these routes to your existing server.js
+// Paste AFTER the existing /api/calendar/sync route
+// ═══════════════════════════════════════════════════════════════════════════
 
-const express    = require('express');
-const cors       = require('cors');
-const { createClient } = require('@supabase/supabase-js');
-const { google } = require('googleapis');
+// ── NEW ENV VARIABLES NEEDED (add to Render) ──────────────────────────────
+// MICROSOFT_CLIENT_ID     — from Azure App Registration
+// MICROSOFT_CLIENT_SECRET — from Azure App Registration
+// MICROSOFT_REDIRECT_URI  — https://execdesk-api.onrender.com/auth/microsoft/callback
+// GOOGLE_REDIRECT_URI must also allow calendar write scope (update existing cred)
+// ─────────────────────────────────────────────────────────────────────────
 
-const app  = express();
-const PORT = process.env.PORT || 3000;
+// ── UPDATE: Change Google Calendar scope to allow writes ──────────────────
+// In your existing /auth/google/url route, change:
+//   'https://www.googleapis.com/auth/calendar.readonly'
+// To:
+//   'https://www.googleapis.com/auth/calendar.events'
+// This allows the agentic AI to actually move/update calendar events.
+// Users will need to re-authorize (revoke at myaccount.google.com/permissions first)
 
-// ── CLIENTS ───────────────────────────────────────────────────────────────────
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_KEY
-);
 
-const oauth2Client = new google.auth.OAuth2(
-  process.env.GOOGLE_CLIENT_ID,
-  process.env.GOOGLE_CLIENT_SECRET,
-  process.env.GOOGLE_REDIRECT_URI
-);
+// ═══════════════════════════════════════════════════════════════════════════
+// FEATURE 1 — AGENTIC AI
+// Analyzes the user's calendar and returns structured action proposals.
+// Semi-auto: low-risk actions execute immediately, high-risk need approval.
+// ═══════════════════════════════════════════════════════════════════════════
 
-// ── MIDDLEWARE ────────────────────────────────────────────────────────────────
-app.use(cors({ origin: '*' }));
-app.use(express.json());
+// Analyze calendar and generate action proposals
+app.post('/api/agent/analyze', requireAuth, async (req, res) => {
+  try {
+    // Fetch next 7 days of events
+    const now   = new Date(); now.setHours(0,0,0,0);
+    const week  = new Date(now.getTime() + 7 * 86400000);
+    const { data: events } = await supabase
+      .from('calendar_events')
+      .select('*')
+      .eq('user_id', req.user.id)
+      .gte('start_time', now.toISOString())
+      .lte('start_time', week.toISOString())
+      .order('start_time', { ascending: true });
 
-async function requireAuth(req, res, next) {
-  const token = req.headers.authorization?.replace('Bearer ', '');
-  if (!token) return res.status(401).json({ error: 'No token provided' });
-  const { data: { user }, error } = await supabase.auth.getUser(token);
-  if (error || !user) return res.status(401).json({ error: 'Invalid token' });
-  req.user = user;
-  next();
+    const { data: actions } = await supabase
+      .from('action_items')
+      .select('title, due_date, status')
+      .eq('user_id', req.user.id)
+      .neq('status', 'done')
+      .limit(10);
+
+    const { data: user } = await supabase
+      .from('users')
+      .select('name, role_title')
+      .eq('id', req.user.id)
+      .single();
+
+    if (!events?.length) {
+      return res.json({ proposals: [], message: 'No events to analyze this week.' });
+    }
+
+    // Build calendar summary for AI
+    const byDay = {};
+    events.forEach(ev => {
+      const d = ev.start_time.slice(0, 10);
+      if (!byDay[d]) byDay[d] = [];
+      byDay[d].push(ev);
+    });
+
+    const calSummary = Object.entries(byDay).map(([date, evs]) => {
+      const nonAllDay = evs.filter(e => !e.is_all_day);
+      return `${date}: ${nonAllDay.length} meetings — ${nonAllDay.map(e =>
+        `[${e.start_time.slice(11,16)} ${e.title}]`).join(', ')}`;
+    }).join('\n');
+
+    const actionSummary = (actions || []).map(a =>
+      `- ${a.title} (due: ${a.due_date || 'no date'})`).join('\n');
+
+    // Ask Claude to generate structured action proposals
+    const prompt = `You are an agentic executive assistant for ${user?.name || 'a CEO'}.
+Analyze this calendar and return ONLY a JSON array of action proposals. No other text.
+
+CALENDAR THIS WEEK:
+${calSummary}
+
+OPEN ACTIONS:
+${actionSummary || 'None'}
+
+Return a JSON array where each item has:
+{
+  "id": "unique_string",
+  "type": "reschedule" | "block_focus" | "add_action" | "cancel_meeting" | "send_reminder" | "protect_time",
+  "title": "short action title",
+  "description": "what this does and why",
+  "risk": "low" | "medium" | "high",
+  "auto_execute": true/false (true only if risk=low and non-destructive),
+  "data": {
+    "event_id": "google event id if applicable",
+    "event_title": "event title",
+    "from_time": "ISO string if reschedule",
+    "to_time": "ISO string if reschedule",
+    "duration_minutes": number if block_focus,
+    "suggested_time": "ISO string if block_focus",
+    "action_title": "string if add_action",
+    "due_date": "YYYY-MM-DD if add_action"
+  }
 }
 
-// ── HEALTH CHECK ──────────────────────────────────────────────────────────────
-app.get('/', (req, res) => {
-  res.json({ status: 'ExecDesk API running', version: '1.1.0' });
+Generate 4-8 proposals. Prioritize: fix overloaded days, add missing focus blocks, flag late meetings, protect personal time after 6pm, add prep reminders for important meetings.`;
+
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': process.env.ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01'
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 2000,
+        messages: [{ role: 'user', content: prompt }]
+      })
+    });
+
+    const aiData = await response.json();
+    let rawText = aiData.content?.[0]?.text || '[]';
+
+    // Clean JSON
+    rawText = rawText.replace(/```json|```/g, '').trim();
+    let proposals = [];
+    try { proposals = JSON.parse(rawText); } catch { proposals = []; }
+
+    // SUGGEST-ONLY mode — always set auto_execute to false
+    // User must approve every single action regardless of risk level
+    proposals = proposals.map(p => ({
+      ...p,
+      auto_execute: false,  // always false — nothing runs without approval
+      risk_label: p.risk === 'low' ? 'Low risk' : p.risk === 'medium' ? 'Medium risk' : 'Review carefully',
+      status: 'pending'
+    }));
+
+    // Save proposals to DB for tracking
+    await supabase.from('agent_proposals').upsert(
+      proposals.map(p => ({
+        user_id: req.user.id,
+        proposal_id: p.id,
+        type: p.type,
+        title: p.title,
+        description: p.description,
+        risk: p.risk,
+        data: p.data,
+        status: 'pending',
+        created_at: new Date().toISOString()
+      })),
+      { onConflict: 'user_id,proposal_id' }
+    ).catch(() => {}); // table may not exist yet — non-fatal
+
+    res.json({ proposals, analyzed_events: events.length });
+  } catch (err) {
+    console.error('[AGENT] Analyze error:', err.message);
+    res.status(500).json({ error: 'Agent analysis failed: ' + err.message });
+  }
 });
 
-// ── AUTH ──────────────────────────────────────────────────────────────────────
 
-app.get('/auth/google/url', (req, res) => {
-  const url = oauth2Client.generateAuthUrl({
-    access_type: 'offline',
-    prompt: 'consent',
-    scope: [
-      'https://www.googleapis.com/auth/calendar.readonly',
-      'https://www.googleapis.com/auth/userinfo.email',
-      'https://www.googleapis.com/auth/userinfo.profile',
-    ]
-  });
+// Execute an approved agent proposal
+app.post('/api/agent/execute', requireAuth, async (req, res) => {
+  const { proposal } = req.body;
+  if (!proposal) return res.status(400).json({ error: 'proposal required' });
+
+  const results = [];
+
+  try {
+    switch (proposal.type) {
+
+      case 'reschedule': {
+        // Move a Google Calendar event to a new time
+        if (!proposal.data?.event_id || !proposal.data?.to_time) {
+          results.push({ success: false, message: 'Missing event_id or to_time' });
+          break;
+        }
+        try {
+          const authClient = await getAuthClient(req.user.id);
+          const calendar   = google.calendar({ version: 'v3', auth: authClient });
+          const { data: existing } = await calendar.events.get({
+            calendarId: 'primary', eventId: proposal.data.event_id
+          });
+          const duration = existing.end
+            ? new Date(existing.end.dateTime) - new Date(existing.start.dateTime)
+            : 3600000;
+          const newStart = new Date(proposal.data.to_time);
+          const newEnd   = new Date(newStart.getTime() + duration);
+          await calendar.events.patch({
+            calendarId: 'primary', eventId: proposal.data.event_id,
+            resource: {
+              start: { dateTime: newStart.toISOString(), timeZone: existing.start.timeZone || 'UTC' },
+              end:   { dateTime: newEnd.toISOString(),   timeZone: existing.end?.timeZone   || 'UTC' }
+            }
+          });
+          // Update Supabase cache
+          await supabase.from('calendar_events')
+            .update({ start_time: newStart.toISOString(), end_time: newEnd.toISOString(), updated_at: new Date().toISOString() })
+            .eq('user_id', req.user.id).eq('google_event_id', proposal.data.event_id);
+          results.push({ success: true, message: `Moved "${proposal.data.event_title}" to ${newStart.toLocaleString()}` });
+        } catch (e) {
+          // Fallback: create an action item to reschedule manually
+          await supabase.from('action_items').insert({
+            user_id: req.user.id,
+            title: `Reschedule: ${proposal.data.event_title}`,
+            due_date: new Date().toISOString().slice(0, 10),
+            status: 'pending'
+          });
+          results.push({ success: true, message: `Added action item to reschedule "${proposal.data.event_title}" (calendar write requires re-authorization)` });
+        }
+        break;
+      }
+
+      case 'block_focus': {
+        // Create a focus block event in Google Calendar
+        try {
+          const authClient = await getAuthClient(req.user.id);
+          const calendar   = google.calendar({ version: 'v3', auth: authClient });
+          const start = new Date(proposal.data.suggested_time || new Date());
+          const end   = new Date(start.getTime() + (proposal.data.duration_minutes || 90) * 60000);
+          await calendar.events.insert({
+            calendarId: 'primary',
+            resource: {
+              summary: '🎯 Focus Block — ExecDesk',
+              description: 'Protected deep work time. Auto-created by ExecDesk AI.',
+              start: { dateTime: start.toISOString() },
+              end:   { dateTime: end.toISOString() },
+              colorId: '9' // Blueberry
+            }
+          });
+          results.push({ success: true, message: `Focus block created: ${start.toLocaleTimeString()} – ${end.toLocaleTimeString()}` });
+        } catch (e) {
+          // Store locally if calendar write fails
+          await supabase.from('action_items').insert({
+            user_id: req.user.id,
+            title: `Block focus time: ${proposal.data.duration_minutes || 90} min`,
+            due_date: new Date().toISOString().slice(0, 10),
+            status: 'pending'
+          });
+          results.push({ success: true, message: 'Focus block saved as action item (re-authorize calendar for auto-creation)' });
+        }
+        break;
+      }
+
+      case 'add_action': {
+        const { error } = await supabase.from('action_items').insert({
+          user_id: req.user.id,
+          title: proposal.data.action_title || proposal.title,
+          due_date: proposal.data.due_date || null,
+          status: 'pending'
+        });
+        if (error) throw error;
+        results.push({ success: true, message: `Action item added: "${proposal.data.action_title}"` });
+        break;
+      }
+
+      case 'protect_time': {
+        // Add a "Personal Time" block
+        try {
+          const authClient = await getAuthClient(req.user.id);
+          const calendar   = google.calendar({ version: 'v3', auth: authClient });
+          const start = new Date(proposal.data.suggested_time || new Date());
+          const end   = new Date(proposal.data.from_time ? new Date(proposal.data.from_time) : start.getTime() + 7200000);
+          await calendar.events.insert({
+            calendarId: 'primary',
+            resource: {
+              summary: '🏠 Personal Time — Protected',
+              description: 'Protected personal time. Auto-created by ExecDesk AI.',
+              start: { dateTime: start.toISOString() },
+              end:   { dateTime: end.toISOString() },
+              colorId: '4' // Sage
+            }
+          });
+          results.push({ success: true, message: 'Personal time block added to your calendar' });
+        } catch (e) {
+          results.push({ success: false, message: 'Could not write to calendar. Re-authorize with calendar.events scope.' });
+        }
+        break;
+      }
+
+      default:
+        results.push({ success: true, message: `Action "${proposal.type}" noted. No calendar change required.` });
+    }
+
+    // Mark proposal as executed
+    await supabase.from('agent_proposals')
+      .update({ status: 'executed', executed_at: new Date().toISOString() })
+      .eq('user_id', req.user.id)
+      .eq('proposal_id', proposal.id)
+      .catch(() => {});
+
+    res.json({ results, executed: true });
+
+  } catch (err) {
+    console.error('[AGENT] Execute error:', err.message);
+    res.status(500).json({ error: 'Execution failed: ' + err.message });
+  }
+});
+
+
+// Dismiss a proposal
+app.post('/api/agent/dismiss', requireAuth, async (req, res) => {
+  const { proposal_id } = req.body;
+  await supabase.from('agent_proposals')
+    .update({ status: 'dismissed' })
+    .eq('user_id', req.user.id)
+    .eq('proposal_id', proposal_id)
+    .catch(() => {});
+  res.json({ success: true });
+});
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FEATURE 2 — MICROSOFT 365 / OUTLOOK CALENDAR SYNC
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Microsoft OAuth URL
+app.get('/auth/microsoft/url', (req, res) => {
+  const clientId    = process.env.MICROSOFT_CLIENT_ID;
+  const redirectUri = encodeURIComponent(process.env.MICROSOFT_REDIRECT_URI || '');
+  const scope       = encodeURIComponent('Calendars.ReadWrite User.Read offline_access');
+  const url = `https://login.microsoftonline.com/common/oauth2/v2.0/authorize?client_id=${clientId}&response_type=code&redirect_uri=${redirectUri}&scope=${scope}&prompt=consent`;
   res.json({ url });
 });
 
-// ── FIXED AUTH CALLBACK ───────────────────────────────────────────────────────
-app.get('/auth/callback', async (req, res) => {
+
+// Microsoft OAuth callback
+app.get('/auth/microsoft/callback', async (req, res) => {
   const APP_URL = process.env.APP_URL || 'http://localhost';
+  const { code, error } = req.query;
 
-  // Google may return an error (e.g. user cancelled)
-  if (req.query.error) {
-    console.error('[AUTH] Google returned error:', req.query.error);
-    return res.redirect(`${APP_URL}?error=${encodeURIComponent(req.query.error)}`);
-  }
-
-  const { code } = req.query;
-  if (!code) {
-    console.error('[AUTH] No code in callback');
-    return res.redirect(`${APP_URL}?error=no_code`);
-  }
+  if (error) return res.redirect(`${APP_URL}?error=${encodeURIComponent(error)}`);
+  if (!code)  return res.redirect(`${APP_URL}?error=no_code_microsoft`);
 
   try {
-    // ── Step 1: Exchange code for Google tokens ───────────────────────────────
-    console.log('[AUTH] Exchanging code for tokens...');
-    const { tokens } = await oauth2Client.getToken(code);
-    oauth2Client.setCredentials(tokens);
-    console.log('[AUTH] Got Google tokens. Has refresh token:', !!tokens.refresh_token);
-
-    // ── Step 2: Get Google profile ────────────────────────────────────────────
-    console.log('[AUTH] Fetching Google profile...');
-    const oauth2Api = google.oauth2({ version: 'v2', auth: oauth2Client });
-    const { data: profile } = await oauth2Api.userinfo.get();
-    console.log('[AUTH] Profile fetched:', profile.email);
-
-    // ── Step 3: Get or create Supabase user ───────────────────────────────────
-    const password = (process.env.SUPABASE_USERS_SECRET || 'default-secret') + profile.id;
-
-    // First try signing in (user already exists)
-    let session = null;
-    console.log('[AUTH] Trying sign in...');
-    const { data: signinData, error: signinError } = await supabase.auth.signInWithPassword({
-      email: profile.email,
-      password
+    // Exchange code for tokens
+    const tokenRes = await fetch('https://login.microsoftonline.com/common/oauth2/v2.0/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        client_id:     process.env.MICROSOFT_CLIENT_ID,
+        client_secret: process.env.MICROSOFT_CLIENT_SECRET,
+        code,
+        redirect_uri:  process.env.MICROSOFT_REDIRECT_URI,
+        grant_type:    'authorization_code'
+      })
     });
 
-    if (signinData?.session) {
-      // Existing user — signed in successfully
-      session = signinData.session;
-      console.log('[AUTH] Existing user signed in successfully');
-    } else {
-      // User not found — create them
-      console.log('[AUTH] Sign in failed:', signinError?.message, '— creating new user...');
+    const tokens = await tokenRes.json();
+    if (tokens.error) throw new Error(tokens.error_description || tokens.error);
 
-      const { data: createData, error: createError } = await supabase.auth.admin.createUser({
-        email: profile.email,
-        password,
-        email_confirm: true,
-        user_metadata: {
-          name: profile.name,
-          avatar_url: profile.picture,
-          google_id: profile.id
-        }
-      });
+    // Get Microsoft user profile
+    const profileRes = await fetch('https://graph.microsoft.com/v1.0/me', {
+      headers: { Authorization: `Bearer ${tokens.access_token}` }
+    });
+    const profile = await profileRes.json();
 
-      if (createError) {
-        // User may already exist with different state — try sign in one more time
-        if (createError.message?.includes('already been registered') || createError.message?.includes('already exists')) {
-          console.log('[AUTH] User already exists, retrying sign in...');
-          const { data: retryData, error: retryError } = await supabase.auth.signInWithPassword({
-            email: profile.email, password
-          });
-          if (retryData?.session) {
-            session = retryData.session;
-            console.log('[AUTH] Retry sign in succeeded');
-          } else {
-            console.error('[AUTH] Retry sign in failed:', retryError?.message);
-            throw new Error('Could not sign in: ' + (retryError?.message || 'unknown error'));
-          }
-        } else {
-          console.error('[AUTH] Create user failed:', createError.message);
-          throw new Error('Could not create user: ' + createError.message);
-        }
-      } else {
-        // New user created — now sign in
-        console.log('[AUTH] New user created:', createData?.user?.id);
-        const { data: newSignin, error: newSigninError } = await supabase.auth.signInWithPassword({
-          email: profile.email, password
-        });
-        if (newSignin?.session) {
-          session = newSignin.session;
-          console.log('[AUTH] New user signed in successfully');
-        } else {
-          console.error('[AUTH] New user sign in failed:', newSigninError?.message);
-          throw new Error('Could not sign in new user: ' + (newSigninError?.message || 'no session'));
-        }
-      }
+    // Find existing Supabase user by email
+    const { data: existingUser } = await supabase
+      .from('users')
+      .select('id')
+      .eq('email', profile.mail || profile.userPrincipalName)
+      .single();
+
+    const userId = existingUser?.id;
+    if (!userId) {
+      return res.redirect(`${APP_URL}?error=microsoft_user_not_found&email=${encodeURIComponent(profile.mail)}`);
     }
 
-    if (!session) {
-      throw new Error('No session obtained after auth flow');
-    }
-
-    // ── Step 4: Save/update user profile + Google tokens in DB ───────────────
-    console.log('[AUTH] Saving user profile to DB...');
-    const { error: upsertError } = await supabase.from('users').upsert({
-      id: session.user.id,
-      email: profile.email,
-      name: profile.name,
-      avatar_url: profile.picture,
-      google_access_token: tokens.access_token,
-      google_refresh_token: tokens.refresh_token || null,
-      google_token_expiry: tokens.expiry_date,
+    // Store Microsoft tokens
+    await supabase.from('users').update({
+      microsoft_access_token:  tokens.access_token,
+      microsoft_refresh_token: tokens.refresh_token,
+      microsoft_token_expiry:  Date.now() + (tokens.expires_in * 1000),
       updated_at: new Date().toISOString()
-    }, { onConflict: 'id' });
+    }).eq('id', userId);
 
-    if (upsertError) {
-      // Non-fatal — log it but continue
-      console.warn('[AUTH] Profile upsert warning:', upsertError.message);
-    }
+    // Kick off Outlook sync
+    syncOutlookForUser(userId, tokens.access_token).catch(console.error);
 
-    // ── Step 5: Kick off calendar sync in background ──────────────────────────
-    console.log('[AUTH] Starting background calendar sync...');
-    syncCalendarForUser(session.user.id, tokens).catch(e =>
-      console.warn('[AUTH] Background sync warning:', e.message)
-    );
-
-    // ── Step 6: Redirect to app with tokens ───────────────────────────────────
-    const redirectUrl = `${APP_URL}?token=${encodeURIComponent(session.access_token)}&refresh=${encodeURIComponent(session.refresh_token)}`;
-    console.log('[AUTH] Redirecting to app. Token length:', session.access_token?.length);
-    return res.redirect(redirectUrl);
+    res.redirect(`${APP_URL}?outlook_connected=true`);
 
   } catch (err) {
-    console.error('[AUTH] Fatal error in callback:', err.message);
-    return res.redirect(`${APP_URL}?error=${encodeURIComponent(err.message)}`);
+    console.error('[MICROSOFT] OAuth error:', err.message);
+    res.redirect(`${APP_URL}?error=${encodeURIComponent('Microsoft auth failed: ' + err.message)}`);
   }
 });
 
-// Refresh session
-app.post('/auth/refresh', async (req, res) => {
-  const { refresh_token } = req.body;
-  if (!refresh_token) return res.status(400).json({ error: 'refresh_token required' });
-  const { data, error } = await supabase.auth.refreshSession({ refresh_token });
-  if (error) return res.status(401).json({ error: 'Session expired. Please log in again.' });
-  res.json({ token: data.session.access_token, refresh: data.session.refresh_token });
-});
 
-// Get current user
-app.get('/auth/me', requireAuth, async (req, res) => {
-  const { data, error } = await supabase
-    .from('users')
-    .select('id, email, name, avatar_url, timezone, role_title, subscription_tier')
-    .eq('id', req.user.id)
-    .single();
-  if (error) {
-    // User row may not exist yet (race condition) — return basic info from JWT
-    return res.json({
-      id: req.user.id,
-      email: req.user.email,
-      name: req.user.user_metadata?.name || req.user.email,
-      avatar_url: req.user.user_metadata?.avatar_url || null,
-      timezone: 'America/New_York',
-      role_title: 'CEO',
-      subscription_tier: 'free'
-    });
-  }
-  res.json(data);
-});
+// Sync Outlook calendar events to Supabase
+async function syncOutlookForUser(userId, accessToken) {
+  // Refresh token if needed
+  let token = accessToken;
+  if (!token) {
+    const { data: user } = await supabase
+      .from('users')
+      .select('microsoft_access_token, microsoft_refresh_token, microsoft_token_expiry')
+      .eq('id', userId)
+      .single();
 
-// ── CALENDAR ──────────────────────────────────────────────────────────────────
+    if (!user?.microsoft_access_token) {
+      throw new Error('No Microsoft tokens. Please connect Outlook.');
+    }
 
-async function getAuthClient(userId) {
-  const { data: user, error } = await supabase
-    .from('users')
-    .select('google_access_token, google_refresh_token, google_token_expiry')
-    .eq('id', userId)
-    .single();
-
-  if (error || !user?.google_refresh_token) {
-    throw new Error('No Google tokens found. Please reconnect your calendar.');
-  }
-
-  const client = new google.auth.OAuth2(
-    process.env.GOOGLE_CLIENT_ID,
-    process.env.GOOGLE_CLIENT_SECRET,
-    process.env.GOOGLE_REDIRECT_URI
-  );
-
-  client.setCredentials({
-    access_token: user.google_access_token,
-    refresh_token: user.google_refresh_token,
-    expiry_date: user.google_token_expiry
-  });
-
-  // Auto-refresh if token is expired or expiring in next 60 seconds
-  if (user.google_token_expiry && Date.now() > user.google_token_expiry - 60000) {
-    try {
-      const { credentials } = await client.refreshAccessToken();
-      await supabase.from('users').update({
-        google_access_token: credentials.access_token,
-        google_token_expiry: credentials.expiry_date
-      }).eq('id', userId);
-      client.setCredentials(credentials);
-      console.log('[CALENDAR] Token refreshed for user:', userId);
-    } catch (e) {
-      console.warn('[CALENDAR] Token refresh failed:', e.message);
+    // Refresh if expired
+    if (user.microsoft_token_expiry && Date.now() > user.microsoft_token_expiry - 60000) {
+      const refreshRes = await fetch('https://login.microsoftonline.com/common/oauth2/v2.0/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          client_id:     process.env.MICROSOFT_CLIENT_ID,
+          client_secret: process.env.MICROSOFT_CLIENT_SECRET,
+          refresh_token: user.microsoft_refresh_token,
+          grant_type:    'refresh_token'
+        })
+      });
+      const refreshed = await refreshRes.json();
+      if (!refreshed.error) {
+        token = refreshed.access_token;
+        await supabase.from('users').update({
+          microsoft_access_token: refreshed.access_token,
+          microsoft_token_expiry: Date.now() + (refreshed.expires_in * 1000)
+        }).eq('id', userId);
+      } else {
+        token = user.microsoft_access_token;
+      }
+    } else {
+      token = user.microsoft_access_token;
     }
   }
 
-  return client;
-}
-
-async function syncCalendarForUser(userId, tokens) {
-  let authClient;
-  if (tokens) {
-    authClient = new google.auth.OAuth2(
-      process.env.GOOGLE_CLIENT_ID,
-      process.env.GOOGLE_CLIENT_SECRET,
-      process.env.GOOGLE_REDIRECT_URI
-    );
-    authClient.setCredentials(tokens);
-  } else {
-    authClient = await getAuthClient(userId);
-  }
-
-  const calendar = google.calendar({ version: 'v3', auth: authClient });
   const now = new Date();
-  const end = new Date(now.getTime() + 14 * 24 * 60 * 60 * 1000);
+  const end = new Date(now.getTime() + 14 * 86400000);
 
-  const { data } = await calendar.events.list({
-    calendarId: 'primary',
-    timeMin: now.toISOString(),
-    timeMax: end.toISOString(),
-    maxResults: 200,
-    singleEvents: true,
-    orderBy: 'startTime'
-  });
+  const eventsRes = await fetch(
+    `https://graph.microsoft.com/v1.0/me/calendarView?startDateTime=${now.toISOString()}&endDateTime=${end.toISOString()}&$top=200&$orderby=start/dateTime`,
+    { headers: { Authorization: `Bearer ${token}`, Prefer: 'outlook.timezone="UTC"' } }
+  );
+  const data = await eventsRes.json();
 
-  const travelKeywords = ['flight', 'hotel', 'travel', 'airport', 'train', 'airbnb', 'check-in', 'check in', 'fly', 'depart', 'arrive', 'layover', 'uber', 'lyft', 'taxi'];
+  const travelKeywords = ['flight','hotel','travel','airport','train','airbnb','check-in','fly','depart','arrive'];
 
-  const events = (data.items || []).map(ev => {
-    const title = ev.summary || '(No title)';
-    const desc  = ev.description || '';
-    const isTravel   = travelKeywords.some(k => (title + desc).toLowerCase().includes(k));
-    const isVirtual  = !!(ev.conferenceData || ev.hangoutLink || desc.match(/zoom\.us|teams\.microsoft|meet\.google/i));
-    const attendees  = (ev.attendees || []).map(a => ({ name: a.displayName || a.email, email: a.email }));
+  const events = (data.value || []).map(ev => {
+    const title = ev.subject || '(No title)';
+    const desc  = ev.body?.content || '';
+    const isTravel  = travelKeywords.some(k => (title + desc).toLowerCase().includes(k));
+    const isVirtual = !!(ev.isOnlineMeeting || ev.onlineMeeting);
+    const attendees = (ev.attendees || []).map(a => ({
+      name:  a.emailAddress?.name  || a.emailAddress?.address,
+      email: a.emailAddress?.address
+    }));
 
     return {
-      user_id: userId,
-      google_event_id: ev.id,
+      user_id:         userId,
+      google_event_id: 'ms_' + ev.id, // prefix to distinguish from Google
       title,
-      description: desc || null,
-      start_time: ev.start?.dateTime || ev.start?.date,
-      end_time:   ev.end?.dateTime   || ev.end?.date,
-      location:   ev.location || null,
+      description:     ev.body?.content?.slice(0, 500) || null,
+      start_time:      ev.start?.dateTime ? new Date(ev.start.dateTime + 'Z').toISOString() : ev.start?.dateTime,
+      end_time:        ev.end?.dateTime   ? new Date(ev.end.dateTime   + 'Z').toISOString() : ev.end?.dateTime,
+      location:        ev.location?.displayName || null,
       attendees,
-      meeting_link: ev.hangoutLink || ev.conferenceData?.entryPoints?.[0]?.uri || null,
-      is_all_day:  !!ev.start?.date,
-      is_travel:   isTravel,
-      is_virtual:  isVirtual,
-      status:      ev.status,
-      updated_at:  new Date().toISOString()
+      meeting_link:    ev.onlineMeeting?.joinUrl || null,
+      is_all_day:      ev.isAllDay || false,
+      is_travel:       isTravel,
+      is_virtual:      isVirtual,
+      status:          ev.isCancelled ? 'cancelled' : 'confirmed',
+      updated_at:      new Date().toISOString()
     };
   });
 
   if (events.length > 0) {
-    const { error } = await supabase.from('calendar_events')
+    await supabase.from('calendar_events')
       .upsert(events, { onConflict: 'user_id,google_event_id' });
-    if (error) console.error('[CALENDAR] Upsert error:', error.message);
   }
 
-  console.log(`[CALENDAR] Synced ${events.length} events for user ${userId}`);
+  console.log(`[OUTLOOK] Synced ${events.length} events for user ${userId}`);
   return events;
 }
 
-app.get('/api/calendar/today', requireAuth, async (req, res) => {
-  syncCalendarForUser(req.user.id).catch(e => console.warn('[SYNC]', e.message));
 
-  const todayStart = new Date(); todayStart.setHours(0,0,0,0);
-  const todayEnd   = new Date(); todayEnd.setHours(23,59,59,999);
-
-  const { data, error } = await supabase
-    .from('calendar_events')
-    .select('*')
-    .eq('user_id', req.user.id)
-    .gte('start_time', todayStart.toISOString())
-    .lte('start_time', todayEnd.toISOString())
-    .order('start_time', { ascending: true });
-
-  if (error) return res.status(500).json({ error: error.message });
-  res.json({ events: data || [], synced_at: new Date().toISOString() });
-});
-
-app.get('/api/calendar/week', requireAuth, async (req, res) => {
-  const start = new Date(); start.setHours(0,0,0,0);
-  const end   = new Date(start.getTime() + 7 * 24 * 60 * 60 * 1000);
-
-  const { data, error } = await supabase
-    .from('calendar_events')
-    .select('*')
-    .eq('user_id', req.user.id)
-    .gte('start_time', start.toISOString())
-    .lte('start_time', end.toISOString())
-    .order('start_time', { ascending: true });
-
-  if (error) return res.status(500).json({ error: error.message });
-
-  const byDay = {};
-  (data || []).forEach(ev => {
-    const day = ev.start_time.slice(0, 10);
-    if (!byDay[day]) byDay[day] = [];
-    byDay[day].push(ev);
-  });
-
-  const days = Object.entries(byDay).map(([date, events]) => ({
-    date,
-    events,
-    is_overloaded: events.filter(e => !e.is_all_day).length >= 4,
-    travel_events: events.filter(e => e.is_travel),
-    meeting_count: events.filter(e => !e.is_all_day && !e.is_travel).length
-  }));
-
-  res.json({ days, total_events: data?.length || 0 });
-});
-
-app.get('/api/calendar/travel', requireAuth, async (req, res) => {
-  const start = new Date();
-  const end   = new Date(start.getTime() + 30 * 24 * 60 * 60 * 1000);
-
-  const { data, error } = await supabase
-    .from('calendar_events')
-    .select('*')
-    .eq('user_id', req.user.id)
-    .eq('is_travel', true)
-    .gte('start_time', start.toISOString())
-    .lte('start_time', end.toISOString())
-    .order('start_time', { ascending: true });
-
-  if (error) return res.status(500).json({ error: error.message });
-  res.json({ travel: data || [] });
-});
-
-app.post('/api/calendar/sync', requireAuth, async (req, res) => {
+// Outlook sync endpoint
+app.post('/api/calendar/sync-outlook', requireAuth, async (req, res) => {
   try {
-    const events = await syncCalendarForUser(req.user.id);
-    res.json({ success: true, synced: events?.length || 0 });
+    const events = await syncOutlookForUser(req.user.id);
+    res.json({ success: true, synced: events.length, source: 'outlook' });
   } catch (err) {
-    res.status(500).json({ error: 'Sync failed: ' + err.message });
+    res.status(500).json({ error: err.message });
   }
 });
 
-// ── AI ADVISOR ────────────────────────────────────────────────────────────────
-app.post('/api/chat', requireAuth, async (req, res) => {
-  const { message } = req.body;
-  if (!message) return res.status(400).json({ error: 'message required' });
+// Check Outlook connection status
+app.get('/api/calendar/outlook-status', requireAuth, async (req, res) => {
+  const { data } = await supabase
+    .from('users')
+    .select('microsoft_access_token, microsoft_token_expiry')
+    .eq('id', req.user.id)
+    .single();
 
-  const todayStart = new Date(); todayStart.setHours(0,0,0,0);
-  const todayEnd   = new Date(); todayEnd.setHours(23,59,59,999);
-  const weekEnd    = new Date(todayStart.getTime() + 7 * 24 * 60 * 60 * 1000);
+  res.json({
+    connected: !!data?.microsoft_access_token,
+    expires_at: data?.microsoft_token_expiry || null
+  });
+});
 
-  const [userRes, todayRes, weekRes, actionsRes, goalsRes, historyRes] = await Promise.all([
-    supabase.from('users').select('name, role_title, timezone').eq('id', req.user.id).single(),
-    supabase.from('calendar_events').select('title, start_time, end_time, attendees, is_travel').eq('user_id', req.user.id).gte('start_time', todayStart.toISOString()).lte('start_time', todayEnd.toISOString()).order('start_time'),
-    supabase.from('calendar_events').select('title, start_time, is_travel').eq('user_id', req.user.id).gte('start_time', todayStart.toISOString()).lte('start_time', weekEnd.toISOString()).order('start_time'),
-    supabase.from('action_items').select('title, due_date, status, delegated_to').eq('user_id', req.user.id).neq('status', 'done').order('due_date'),
-    supabase.from('goals').select('title, progress_pct, target_date').eq('user_id', req.user.id).order('created_at'),
-    supabase.from('ai_conversations').select('role, content').eq('user_id', req.user.id).order('created_at', { ascending: false }).limit(10)
-  ]);
 
-  const user       = userRes.data || {};
-  const todayEvs   = todayRes.data || [];
-  const weekEvs    = weekRes.data  || [];
-  const actions    = actionsRes.data || [];
-  const goals      = goalsRes.data   || [];
-  const history    = (historyRes.data || []).reverse();
+// ═══════════════════════════════════════════════════════════════════════════
+// FEATURE 3 — MEETING TRANSCRIPTION + AUTO ACTION EXTRACTION
+// Accepts transcript text, returns AI summary + structured action items
+// ═══════════════════════════════════════════════════════════════════════════
 
-  const fmt = iso => new Date(iso).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+app.post('/api/transcription/extract', requireAuth, async (req, res) => {
+  const { transcript, meeting_title, meeting_date } = req.body;
+  if (!transcript || transcript.trim().length < 20) {
+    return res.status(400).json({ error: 'Transcript must be at least 20 characters' });
+  }
 
-  const todaySummary  = todayEvs.map(e => `  ${fmt(e.start_time)} - ${e.title}${e.is_travel ? ' [TRAVEL]' : ''}`).join('\n') || '  No meetings today';
-  const actionSummary = actions.slice(0,5).map(a => `  - ${a.title} (due: ${a.due_date || 'no date'}${a.delegated_to ? ', delegated to ' + a.delegated_to : ''})`).join('\n') || '  No open actions';
-  const goalSummary   = goals.map(g => `  - ${g.title}: ${g.progress_pct}%`).join('\n') || '  No goals set';
-  const overloadDays  = Object.entries(weekEvs.reduce((a,e) => { const d=e.start_time.slice(0,10); a[d]=(a[d]||0)+1; return a; }, {})).filter(([,c])=>c>=4).map(([d])=>d).join(', ') || 'none';
+  const prompt = `You are an AI chief of staff extracting key information from a meeting transcript.
 
-  const context = `Executive: ${user.name || req.user.email} — ${user.role_title || 'CEO/Executive'}
-Today (${new Date().toDateString()}):
-${todaySummary}
+Meeting: "${meeting_title || 'Meeting'}"
+Date: ${meeting_date || new Date().toLocaleDateString()}
 
-Open action items:
-${actionSummary}
+TRANSCRIPT:
+${transcript.slice(0, 8000)}
 
-Goals & OKR progress:
-${goalSummary}
-
-Overloaded days this week (4+ meetings): ${overloadDays}
-Travel events detected: ${weekEvs.filter(e=>e.is_travel).map(e=>e.title).join(', ') || 'none'}`;
-
-  await supabase.from('ai_conversations').insert({ user_id: req.user.id, role: 'user', content: message });
-
-  const messages = [
-    ...history.map(h => ({ role: h.role, content: h.content })),
-    { role: 'user', content: message }
-  ];
+Return ONLY valid JSON with this structure:
+{
+  "summary": "2-3 sentence summary of what was discussed and decided",
+  "key_decisions": ["decision 1", "decision 2"],
+  "action_items": [
+    {
+      "task": "specific action item",
+      "owner": "person responsible (or 'Me' if unclear)",
+      "due_date": "YYYY-MM-DD or null",
+      "priority": "high|medium|low"
+    }
+  ],
+  "follow_up_questions": ["question 1", "question 2"],
+  "sentiment": "positive|neutral|tense|productive",
+  "next_meeting_topics": ["topic 1", "topic 2"]
+}`;
 
   try {
-    const r = await fetch('https://api.anthropic.com/v1/messages', {
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': process.env.ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01'
+      },
       body: JSON.stringify({
         model: 'claude-sonnet-4-20250514',
-        max_tokens: 1000,
-        system: `You are an elite executive advisor and chief of staff. Be direct, concise, and actionable. No filler. Use the executive's real schedule data to give specific recommendations. Context:\n\n${context}`,
-        messages
+        max_tokens: 1500,
+        messages: [{ role: 'user', content: prompt }]
       })
     });
-    const data  = await r.json();
-    const reply = data.content?.[0]?.text || 'Unable to respond right now.';
-    await supabase.from('ai_conversations').insert({ user_id: req.user.id, role: 'assistant', content: reply });
-    res.json({ reply });
+
+    const data = await response.json();
+    let raw = data.content?.[0]?.text || '{}';
+    raw = raw.replace(/```json|```/g, '').trim();
+
+    let result;
+    try { result = JSON.parse(raw); }
+    catch { result = { summary: raw, action_items: [], key_decisions: [] }; }
+
+    // Auto-save action items to DB (ones owned by "Me")
+    const myActions = (result.action_items || []).filter(a =>
+      !a.owner || a.owner.toLowerCase() === 'me' || a.owner.toLowerCase().includes('ceo')
+    );
+
+    if (myActions.length > 0) {
+      await supabase.from('action_items').insert(
+        myActions.map(a => ({
+          user_id:  req.user.id,
+          title:    `[${meeting_title || 'Meeting'}] ${a.task}`,
+          due_date: a.due_date || null,
+          status:   'pending',
+          priority: a.priority || 'medium'
+        }))
+      );
+    }
+
+    // Save transcript and result to DB
+    await supabase.from('meeting_transcripts').insert({
+      user_id:        req.user.id,
+      meeting_title:  meeting_title || 'Meeting',
+      meeting_date:   meeting_date || new Date().toISOString().slice(0, 10),
+      transcript:     transcript.slice(0, 10000),
+      ai_summary:     result.summary,
+      action_items:   result.action_items,
+      key_decisions:  result.key_decisions,
+      created_at:     new Date().toISOString()
+    }).catch(() => {}); // table may not exist yet
+
+    res.json({
+      ...result,
+      auto_saved_actions: myActions.length,
+      message: myActions.length > 0
+        ? `${myActions.length} action item${myActions.length > 1 ? 's' : ''} auto-added to your list`
+        : 'No personal action items detected'
+    });
+
   } catch (err) {
-    console.error('[AI] Error:', err.message);
-    res.status(500).json({ error: 'AI service unavailable' });
+    console.error('[TRANSCRIPTION] Error:', err.message);
+    res.status(500).json({ error: 'Transcription extraction failed: ' + err.message });
   }
 });
 
-// ── ACTIONS ───────────────────────────────────────────────────────────────────
-app.get('/api/actions', requireAuth, async (req, res) => {
-  const { data, error } = await supabase.from('action_items').select('*').eq('user_id', req.user.id).order('due_date', { ascending: true, nullsLast: true });
+
+// Get past transcripts
+app.get('/api/transcription/history', requireAuth, async (req, res) => {
+  const { data, error } = await supabase
+    .from('meeting_transcripts')
+    .select('id, meeting_title, meeting_date, ai_summary, action_items, key_decisions, created_at')
+    .eq('user_id', req.user.id)
+    .order('created_at', { ascending: false })
+    .limit(20);
+
   if (error) return res.status(500).json({ error: error.message });
-  res.json({ actions: data || [] });
+  res.json({ transcripts: data || [] });
 });
 
-app.post('/api/actions', requireAuth, async (req, res) => {
-  const { title, due_date, delegated_to, priority } = req.body;
-  if (!title) return res.status(400).json({ error: 'title required' });
-  const { data, error } = await supabase.from('action_items').insert({ user_id: req.user.id, title, due_date: due_date || null, delegated_to: delegated_to || null, priority: priority || 'medium', status: 'pending' }).select().single();
-  if (error) return res.status(500).json({ error: error.message });
-  res.json({ action: data });
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FEATURE 4 — NATURAL LANGUAGE COMMAND PROCESSOR
+// Interprets free-text commands and returns structured intents + executes them
+// ═══════════════════════════════════════════════════════════════════════════
+
+app.post('/api/nlp/command', requireAuth, async (req, res) => {
+  const { command } = req.body;
+  if (!command?.trim()) return res.status(400).json({ error: 'command required' });
+
+  // Get context for the AI
+  const now = new Date();
+  const week = new Date(now.getTime() + 7 * 86400000);
+  const [eventsRes, actionsRes, goalsRes] = await Promise.all([
+    supabase.from('calendar_events').select('title, start_time, end_time, google_event_id')
+      .eq('user_id', req.user.id)
+      .gte('start_time', now.toISOString())
+      .lte('start_time', week.toISOString())
+      .order('start_time')
+      .limit(30),
+    supabase.from('action_items').select('id, title, due_date, status')
+      .eq('user_id', req.user.id).neq('status', 'done').limit(10),
+    supabase.from('goals').select('id, title, progress_pct').eq('user_id', req.user.id).limit(5)
+  ]);
+
+  const calCtx = (eventsRes.data || []).map(e =>
+    `${e.start_time.slice(0,16).replace('T',' ')} — ${e.title} [id:${e.google_event_id}]`
+  ).join('\n');
+
+  const today = now.toISOString().slice(0, 10);
+  const prompt = `You are an AI command interpreter for an executive assistant app.
+Today is ${now.toLocaleDateString('en-US', { weekday:'long', year:'numeric', month:'long', day:'numeric' })}.
+
+USER'S UPCOMING CALENDAR:
+${calCtx || 'No upcoming events'}
+
+USER'S OPEN ACTIONS:
+${(actionsRes.data || []).map(a => `[${a.id}] ${a.title} (due: ${a.due_date || 'none'})`).join('\n') || 'None'}
+
+USER COMMAND: "${command}"
+
+Interpret the command and return ONLY valid JSON:
+{
+  "intent": "add_action | complete_action | search_calendar | block_focus | reschedule | check_schedule | update_goal | log_energy | ask_advisor | unknown",
+  "confidence": 0.0-1.0,
+  "response": "confirmation message to show the user (friendly, concise)",
+  "action": {
+    "type": "same as intent",
+    "title": "if add_action",
+    "due_date": "YYYY-MM-DD if specified, else null",
+    "action_id": "if completing an existing action",
+    "event_id": "google event id if calendar action",
+    "query": "if search_calendar",
+    "duration_minutes": "if block_focus",
+    "energy_level": 1-5 if log_energy,
+    "goal_progress": 0-100 if update_goal,
+    "message": "if ask_advisor — the message to send"
+  }
+}`;
+
+  try {
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': process.env.ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01'
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 500,
+        messages: [{ role: 'user', content: prompt }]
+      })
+    });
+
+    const data = await response.json();
+    let raw = data.content?.[0]?.text || '{}';
+    raw = raw.replace(/```json|```/g, '').trim();
+
+    let intent;
+    try { intent = JSON.parse(raw); }
+    catch { intent = { intent: 'unknown', confidence: 0.5, response: raw, action: {} }; }
+
+    // Auto-execute safe intents
+    let executed = false;
+    let executionResult = null;
+
+    if (intent.confidence >= 0.75) {
+      switch (intent.intent) {
+        case 'add_action': {
+          const { data: newAction } = await supabase.from('action_items').insert({
+            user_id:  req.user.id,
+            title:    intent.action?.title || command,
+            due_date: intent.action?.due_date || null,
+            status:   'pending'
+          }).select().single();
+          executed = true;
+          executionResult = { action_id: newAction?.id };
+          break;
+        }
+        case 'complete_action': {
+          if (intent.action?.action_id) {
+            await supabase.from('action_items')
+              .update({ status: 'done', updated_at: new Date().toISOString() })
+              .eq('id', intent.action.action_id)
+              .eq('user_id', req.user.id);
+            executed = true;
+          }
+          break;
+        }
+        case 'log_energy': {
+          if (intent.action?.energy_level) {
+            // This is stored client-side in localStorage — return the value to execute
+            executed = true;
+            executionResult = { energy_level: intent.action.energy_level, date: today };
+          }
+          break;
+        }
+      }
+    }
+
+    res.json({
+      ...intent,
+      executed,
+      execution_result: executionResult,
+      original_command: command
+    });
+
+  } catch (err) {
+    console.error('[NLP] Error:', err.message);
+    res.status(500).json({ error: 'Command processing failed: ' + err.message });
+  }
 });
 
-app.patch('/api/actions/:id', requireAuth, async (req, res) => {
-  const updates = { updated_at: new Date().toISOString() };
-  ['status','title','due_date'].forEach(k => { if (req.body[k] !== undefined) updates[k] = req.body[k]; });
-  const { data, error } = await supabase.from('action_items').update(updates).eq('id', req.params.id).eq('user_id', req.user.id).select().single();
-  if (error) return res.status(500).json({ error: error.message });
-  res.json({ action: data });
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SUPABASE SCHEMA ADDITIONS
+// Run these in Supabase SQL Editor to support new features
+// ═══════════════════════════════════════════════════════════════════════════
+
+/*
+-- Agent proposals table
+CREATE TABLE IF NOT EXISTS public.agent_proposals (
+  id            uuid default uuid_generate_v4() primary key,
+  user_id       uuid not null references public.users(id) on delete cascade,
+  proposal_id   text not null,
+  type          text not null,
+  title         text not null,
+  description   text,
+  risk          text default 'medium',
+  data          jsonb default '{}',
+  status        text default 'pending',
+  executed_at   timestamptz,
+  created_at    timestamptz default now(),
+  unique(user_id, proposal_id)
+);
+ALTER TABLE public.agent_proposals DISABLE ROW LEVEL SECURITY;
+
+-- Meeting transcripts table
+CREATE TABLE IF NOT EXISTS public.meeting_transcripts (
+  id             uuid default uuid_generate_v4() primary key,
+  user_id        uuid not null references public.users(id) on delete cascade,
+  meeting_title  text,
+  meeting_date   date,
+  transcript     text,
+  ai_summary     text,
+  action_items   jsonb default '[]',
+  key_decisions  jsonb default '[]',
+  created_at     timestamptz default now()
+);
+ALTER TABLE public.meeting_transcripts DISABLE ROW LEVEL SECURITY;
+
+-- Microsoft tokens in users table
+ALTER TABLE public.users ADD COLUMN IF NOT EXISTS microsoft_access_token  text;
+ALTER TABLE public.users ADD COLUMN IF NOT EXISTS microsoft_refresh_token text;
+ALTER TABLE public.users ADD COLUMN IF NOT EXISTS microsoft_token_expiry  bigint;
+*/
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// EMAIL + PASSWORD AUTH ROUTES
+// Add these to server.js alongside the existing OAuth routes
+// Supabase handles password hashing and email confirmation automatically
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Sign up with email + password
+app.post('/auth/email/signup', async (req, res) => {
+  const { name, email, password } = req.body;
+  if (!email || !password || !name)
+    return res.status(400).json({ error: 'Name, email and password are required.' });
+  if (password.length < 8)
+    return res.status(400).json({ error: 'Password must be at least 8 characters.' });
+
+  try {
+    const { data, error } = await supabase.auth.signUp({
+      email, password,
+      options: { data: { name } }
+    });
+    if (error) {
+      // Surface friendly messages for common Supabase errors
+      if (error.message.includes('already registered'))
+        return res.status(400).json({ error: 'This email is already registered. Please sign in instead.' });
+      return res.status(400).json({ error: error.message });
+    }
+
+    // If email confirmation is disabled in Supabase (Settings → Auth → Email),
+    // the session is returned immediately and we can sign them straight in.
+    if (data.session) {
+      // Upsert user profile
+      await supabase.from('users').upsert({
+        id: data.user.id, email, name,
+        updated_at: new Date().toISOString()
+      }, { onConflict: 'id' }).catch(() => {});
+
+      return res.json({
+        token:   data.session.access_token,
+        refresh: data.session.refresh_token,
+        user:    { id: data.user.id, email, name }
+      });
+    }
+
+    // Email confirmation is ON — tell the frontend to wait
+    res.json({ message: 'Please check your email to confirm your account.' });
+  } catch (err) {
+    res.status(500).json({ error: 'Sign up failed: ' + err.message });
+  }
 });
 
-app.delete('/api/actions/:id', requireAuth, async (req, res) => {
-  await supabase.from('action_items').delete().eq('id', req.params.id).eq('user_id', req.user.id);
-  res.json({ success: true });
+
+// Sign in with email + password
+app.post('/auth/email/signin', async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password)
+    return res.status(400).json({ error: 'Email and password are required.' });
+
+  try {
+    const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+    if (error) {
+      if (error.message.includes('Invalid login'))
+        return res.status(401).json({ error: 'Incorrect email or password. Please try again.' });
+      if (error.message.includes('Email not confirmed'))
+        return res.status(401).json({ error: 'Please confirm your email address first. Check your inbox.' });
+      return res.status(401).json({ error: error.message });
+    }
+
+    // Ensure user row exists in our users table
+    const { data: profile } = await supabase
+      .from('users').select('name, role_title, subscription_tier')
+      .eq('id', data.user.id).single();
+
+    if (!profile) {
+      await supabase.from('users').upsert({
+        id: data.user.id, email,
+        name: data.user.user_metadata?.name || email.split('@')[0],
+        updated_at: new Date().toISOString()
+      }, { onConflict: 'id' }).catch(() => {});
+    }
+
+    res.json({
+      token:   data.session.access_token,
+      refresh: data.session.refresh_token,
+      user: {
+        id:    data.user.id,
+        email: data.user.email,
+        name:  profile?.name || data.user.user_metadata?.name || email.split('@')[0],
+        role_title:        profile?.role_title || null,
+        subscription_tier: profile?.subscription_tier || 'free'
+      }
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'Sign in failed: ' + err.message });
+  }
 });
 
-// ── GOALS ─────────────────────────────────────────────────────────────────────
-app.get('/api/goals', requireAuth, async (req, res) => {
-  const { data, error } = await supabase.from('goals').select('*').eq('user_id', req.user.id).order('created_at');
-  if (error) return res.status(500).json({ error: error.message });
-  res.json({ goals: data || [] });
+
+// Forgot password — sends reset email via Supabase
+app.post('/auth/email/forgot', async (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ error: 'Email is required.' });
+
+  try {
+    await supabase.auth.resetPasswordForEmail(email, {
+      redirectTo: `${process.env.APP_URL}/reset-password`
+    });
+    // Always return success — don't reveal whether email exists (security)
+    res.json({ message: 'If that email exists, a reset link has been sent.' });
+  } catch (err) {
+    res.json({ message: 'If that email exists, a reset link has been sent.' });
+  }
 });
 
-app.post('/api/goals', requireAuth, async (req, res) => {
-  const { title, target_date, progress_pct, notes } = req.body;
-  if (!title) return res.status(400).json({ error: 'title required' });
-  const { data, error } = await supabase.from('goals').insert({ user_id: req.user.id, title, target_date: target_date || null, progress_pct: progress_pct || 0, notes: notes || null }).select().single();
-  if (error) return res.status(500).json({ error: error.message });
-  res.json({ goal: data });
+
+// Delete account — removes all user data
+app.delete('/api/account', requireAuth, async (req, res) => {
+  const userId = req.user.id;
+  try {
+    // Delete all user data in order (foreign key safe)
+    await supabase.from('ai_conversations').delete().eq('user_id', userId);
+    await supabase.from('action_items').delete().eq('user_id', userId);
+    await supabase.from('goals').delete().eq('user_id', userId);
+    await supabase.from('calendar_events').delete().eq('user_id', userId);
+    await supabase.from('agent_proposals').delete().eq('user_id', userId).catch(() => {});
+    await supabase.from('meeting_transcripts').delete().eq('user_id', userId).catch(() => {});
+    await supabase.from('users').delete().eq('id', userId);
+    // Delete Supabase Auth user (requires service role key)
+    await supabase.auth.admin.deleteUser(userId);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Account deletion failed: ' + err.message });
+  }
 });
 
-app.patch('/api/goals/:id', requireAuth, async (req, res) => {
-  const updates = { updated_at: new Date().toISOString() };
-  ['progress_pct','title','notes'].forEach(k => { if (req.body[k] !== undefined) updates[k] = req.body[k]; });
-  const { data, error } = await supabase.from('goals').update(updates).eq('id', req.params.id).eq('user_id', req.user.id).select().single();
-  if (error) return res.status(500).json({ error: error.message });
-  res.json({ goal: data });
-});
-
-// ── SETTINGS ──────────────────────────────────────────────────────────────────
-app.patch('/api/settings', requireAuth, async (req, res) => {
-  const updates = { updated_at: new Date().toISOString() };
-  ['role_title','timezone','name'].forEach(k => { if (req.body[k] !== undefined) updates[k] = req.body[k]; });
-  const { data, error } = await supabase.from('users').update(updates).eq('id', req.user.id).select().single();
-  if (error) return res.status(500).json({ error: error.message });
-  res.json({ user: data });
-});
-
-// ── START ─────────────────────────────────────────────────────────────────────
-app.listen(PORT, () => console.log(`ExecDesk backend running on port ${PORT}`));
+// ── SETUP NOTE ────────────────────────────────────────────────────────────────
+// To disable email confirmation (simpler for launch):
+// Supabase Dashboard → Authentication → Settings → Email Auth
+// → Disable "Enable email confirmations"
+// Users will be signed in immediately after registering.
