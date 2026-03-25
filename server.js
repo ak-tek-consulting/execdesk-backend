@@ -318,15 +318,291 @@ app.post('/api/calendar/sync', requireAuth, async (req, res) => {
     res.status(500).json({ error: 'Sync failed: ' + err.message });
   }
 });
-// ─────────────────────────────────────────────────────────────────────────────
-// PAST MEETINGS — Add these routes to your existing server.js
-// Paste them right after the /api/calendar/sync route (around line 400)
-// ─────────────────────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+// PAST MEETINGS HISTORY ROUTES — Fixed version
+//
+// PASTE LOCATION: In server.js, paste this AFTER the syncCalendarForUser
+// function and AFTER the /api/calendar/sync route. It must come AFTER
+// getAuthClient is defined (around line 222 in your server.js).
+//
+// QUICK CHECK: Search your server.js for "async function getAuthClient"
+// The code below must appear AFTER that function definition.
+// ═══════════════════════════════════════════════════════════════════════════
 
-// ── FETCH PAST EVENTS FROM GOOGLE CALENDAR ────────────────────────────────────
-// Fetches historical events, caches them in Supabase, returns them.
-// Accepts: ?start=YYYY-MM-DD&end=YYYY-MM-DD (both required)
-// Max range: 90 days to avoid quota issues
+
+// ── /api/calendar/history ─────────────────────────────────────────────────────
+// Fetches past calendar events. Checks Supabase cache first.
+// If cache is empty for the range, fetches from Google Calendar API.
+// ?start=YYYY-MM-DD&end=YYYY-MM-DD
+
+app.get('/api/calendar/history', requireAuth, async (req, res) => {
+  const { start, end } = req.query;
+
+  if (!start || !end) {
+    return res.status(400).json({ error: 'start and end params required (YYYY-MM-DD)' });
+  }
+
+  const startDate = new Date(start);
+  const endDate   = new Date(end);
+  endDate.setHours(23, 59, 59, 999);
+
+  if (isNaN(startDate.getTime()) || isNaN(endDate.getTime())) {
+    return res.status(400).json({ error: 'Invalid date format. Use YYYY-MM-DD.' });
+  }
+
+  const diffDays = (endDate - startDate) / (1000 * 60 * 60 * 24);
+  if (diffDays > 90) {
+    return res.status(400).json({ error: 'Date range cannot exceed 90 days' });
+  }
+
+  const travelKeywords = ['flight','hotel','travel','airport','train','airbnb',
+    'check-in','check in','fly','depart','arrive','layover'];
+
+  // ── Step 1: Check Supabase cache ──────────────────────────────────────────
+  try {
+    const { data: cached, error: cacheErr } = await supabase
+      .from('calendar_events')
+      .select('*')
+      .eq('user_id', req.user.id)
+      .gte('start_time', startDate.toISOString())
+      .lte('start_time', endDate.toISOString())
+      .order('start_time', { ascending: true });
+
+    if (cacheErr) {
+      console.warn('[HISTORY] Cache read error:', cacheErr.message);
+    } else if (cached && cached.length > 0) {
+      console.log(`[HISTORY] Cache hit: ${cached.length} events for ${start} → ${end}`);
+      return res.json({ events: cached, source: 'cache', total: cached.length });
+    }
+  } catch (cacheEx) {
+    console.warn('[HISTORY] Cache exception:', cacheEx.message);
+  }
+
+  // ── Step 2: Fetch from Google Calendar API ────────────────────────────────
+  // getAuthClient is defined in server.js — this must be pasted AFTER it.
+  let googleEvents = [];
+  let fetchedFromGoogle = false;
+
+  try {
+    // This is the line that was failing — getAuthClient must exist in scope.
+    // If you see "getAuthClient is not defined", move this paste location
+    // to AFTER the getAuthClient function in server.js.
+    const authClient = await getAuthClient(req.user.id);
+
+    // google is the googleapis require at the top of server.js:
+    // const { google } = require('googleapis');
+    const calendar = google.calendar({ version: 'v3', auth: authClient });
+
+    const { data } = await calendar.events.list({
+      calendarId:   'primary',
+      timeMin:      startDate.toISOString(),
+      timeMax:      endDate.toISOString(),
+      maxResults:   500,
+      singleEvents: true,
+      orderBy:      'startTime'
+    });
+
+    googleEvents = (data.items || []).map(ev => {
+      const title = ev.summary || '(No title)';
+      const desc  = ev.description || '';
+      const isTravel  = travelKeywords.some(k => (title + desc).toLowerCase().includes(k));
+      const isVirtual = !!(
+        ev.conferenceData || ev.hangoutLink ||
+        desc.match(/zoom\.us|teams\.microsoft|meet\.google/i)
+      );
+      const attendees = (ev.attendees || []).map(a => ({
+        name:  a.displayName || a.email,
+        email: a.email
+      }));
+
+      return {
+        user_id:         req.user.id,
+        google_event_id: ev.id,
+        title,
+        description:     desc || null,
+        start_time:      ev.start?.dateTime || ev.start?.date,
+        end_time:        ev.end?.dateTime   || ev.end?.date,
+        location:        ev.location || null,
+        attendees,
+        meeting_link:    ev.hangoutLink || ev.conferenceData?.entryPoints?.[0]?.uri || null,
+        is_all_day:      !!ev.start?.date && !ev.start?.dateTime,
+        is_travel:       isTravel,
+        is_virtual:      isVirtual,
+        status:          ev.status || 'confirmed',
+        updated_at:      new Date().toISOString()
+      };
+    });
+
+    fetchedFromGoogle = true;
+    console.log(`[HISTORY] Fetched ${googleEvents.length} events from Google for ${start} → ${end}`);
+
+    // Cache in Supabase for next time
+    if (googleEvents.length > 0) {
+      const { error: upsertErr } = await supabase
+        .from('calendar_events')
+        .upsert(googleEvents, { onConflict: 'user_id,google_event_id' });
+      if (upsertErr) {
+        console.warn('[HISTORY] Upsert warning (non-fatal):', upsertErr.message);
+      }
+    }
+
+    return res.json({
+      events: googleEvents,
+      source: 'google',
+      total:  googleEvents.length
+    });
+
+  } catch (googleErr) {
+    // Google fetch failed — log it and fall through to empty response
+    console.error('[HISTORY] Google Calendar fetch failed:', googleErr.message);
+
+    // One more try: maybe cache was written by another request in the meantime
+    try {
+      const { data: fallback } = await supabase
+        .from('calendar_events')
+        .select('*')
+        .eq('user_id', req.user.id)
+        .gte('start_time', startDate.toISOString())
+        .lte('start_time', endDate.toISOString())
+        .order('start_time', { ascending: true });
+
+      if (fallback && fallback.length > 0) {
+        console.log(`[HISTORY] Fallback cache: ${fallback.length} events`);
+        return res.json({ events: fallback, source: 'cache_fallback', total: fallback.length });
+      }
+    } catch (_) {}
+
+    // Nothing worked — return the error so the frontend can show it
+    return res.status(500).json({
+      error: `Could not load history: ${googleErr.message}. ` +
+             `If this is "getAuthClient is not defined", paste this code ` +
+             `AFTER the getAuthClient function in server.js.`
+    });
+  }
+});
+
+
+// ── /api/calendar/search ──────────────────────────────────────────────────────
+// Search cached events by title, description, or attendee name
+// ?q=search+term&limit=50
+
+app.get('/api/calendar/search', requireAuth, async (req, res) => {
+  const { q, limit = 50 } = req.query;
+
+  if (!q || q.trim().length < 2) {
+    return res.status(400).json({ error: 'Search query must be at least 2 characters' });
+  }
+
+  const term = q.trim();
+
+  try {
+    // Search by title
+    const { data: byTitle, error: e1 } = await supabase
+      .from('calendar_events')
+      .select('*')
+      .eq('user_id', req.user.id)
+      .ilike('title', `%${term}%`)
+      .order('start_time', { ascending: false })
+      .limit(parseInt(limit));
+
+    if (e1) return res.status(500).json({ error: e1.message });
+
+    // Search by description
+    const { data: byDesc } = await supabase
+      .from('calendar_events')
+      .select('*')
+      .eq('user_id', req.user.id)
+      .ilike('description', `%${term}%`)
+      .order('start_time', { ascending: false })
+      .limit(20);
+
+    // Deduplicate by id
+    const seen = new Set();
+    const merged = [...(byTitle || []), ...(byDesc || [])]
+      .filter(ev => { if (seen.has(ev.id)) return false; seen.add(ev.id); return true; })
+      .sort((a, b) => new Date(b.start_time) - new Date(a.start_time))
+      .slice(0, parseInt(limit));
+
+    // Also search attendees in memory (JSONB search varies by Supabase version)
+    const termLower = term.toLowerCase();
+    const { data: allCached } = await supabase
+      .from('calendar_events')
+      .select('*')
+      .eq('user_id', req.user.id)
+      .order('start_time', { ascending: false })
+      .limit(500);
+
+    const attMatches = (allCached || []).filter(ev => {
+      if (seen.has(ev.id)) return false;
+      return JSON.stringify(ev.attendees || []).toLowerCase().includes(termLower);
+    }).slice(0, 20);
+
+    attMatches.forEach(ev => seen.add(ev.id));
+
+    const results = [...merged, ...attMatches]
+      .sort((a, b) => new Date(b.start_time) - new Date(a.start_time))
+      .slice(0, parseInt(limit));
+
+    console.log(`[SEARCH] "${term}" → ${results.length} results`);
+    res.json({ results, query: q, total: results.length });
+
+  } catch (err) {
+    console.error('[SEARCH] Error:', err.message);
+    res.status(500).json({ error: 'Search failed: ' + err.message });
+  }
+});
+
+
+// ── /api/calendar/month-summary ───────────────────────────────────────────────
+// Aggregated stats for a given month
+// ?year=2026&month=3
+
+app.get('/api/calendar/month-summary', requireAuth, async (req, res) => {
+  const year  = parseInt(req.query.year  || new Date().getFullYear());
+  const month = parseInt(req.query.month || new Date().getMonth() + 1);
+
+  const start = new Date(year, month - 1, 1);
+  const end   = new Date(year, month, 0, 23, 59, 59, 999);
+
+  const { data, error } = await supabase
+    .from('calendar_events')
+    .select('title, start_time, end_time, is_all_day, is_travel, is_virtual, attendees')
+    .eq('user_id', req.user.id)
+    .gte('start_time', start.toISOString())
+    .lte('start_time', end.toISOString())
+    .order('start_time', { ascending: true });
+
+  if (error) return res.status(500).json({ error: error.message });
+
+  const events   = data || [];
+  const meetings = events.filter(e => !e.is_all_day && !e.is_travel);
+  const travel   = events.filter(e => e.is_travel);
+  const totalMin = meetings.reduce((a, e) => {
+    const dur = (new Date(e.end_time) - new Date(e.start_time)) / 60000;
+    return a + (isNaN(dur) ? 0 : dur);
+  }, 0);
+
+  const peopleSet = new Set();
+  meetings.forEach(e => (e.attendees || []).forEach(a => a.email && peopleSet.add(a.email)));
+
+  const byDay = {};
+  meetings.forEach(e => {
+    const d = e.start_time.slice(0, 10);
+    byDay[d] = (byDay[d] || 0) + 1;
+  });
+  const busiestDay = Object.entries(byDay).sort(([,a],[,b]) => b - a)[0];
+
+  res.json({
+    month:               `${year}-${String(month).padStart(2,'0')}`,
+    total_events:        events.length,
+    total_meetings:      meetings.length,
+    total_travel:        travel.length,
+    total_meeting_hours: Math.round(totalMin / 60 * 10) / 10,
+    unique_attendees:    peopleSet.size,
+    busiest_day:         busiestDay ? { date: busiestDay[0], count: busiestDay[1] } : null,
+    virtual_meetings:    meetings.filter(e => e.is_virtual).length
+  });
+});
 
 app.get('/api/calendar/history', requireAuth, async (req, res) => {
   const { start, end } = req.query;
