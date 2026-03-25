@@ -237,6 +237,46 @@ async function syncCalendarForUser(userId, tokens) {
   return events;
 }
 
+// Helper: build an authenticated OAuth2 client for a given user.
+// Fetches tokens from Supabase, refreshes if expired, and returns the client.
+async function getAuthClient(userId) {
+  const { data: user, error } = await supabase
+    .from('users')
+    .select('google_access_token, google_refresh_token, google_token_expiry')
+    .eq('id', userId)
+    .single();
+
+  if (error || !user?.google_refresh_token) {
+    throw new Error('No Google credentials found for user. Please reconnect your Google account.');
+  }
+
+  const tokens = {
+    access_token:  user.google_access_token,
+    refresh_token: user.google_refresh_token,
+    expiry_date:   user.google_token_expiry
+  };
+
+  // Create a fresh client instance so concurrent requests don't clobber each other
+  const authClient = new google.auth.OAuth2(
+    process.env.GOOGLE_CLIENT_ID,
+    process.env.GOOGLE_CLIENT_SECRET,
+    process.env.GOOGLE_REDIRECT_URI
+  );
+  authClient.setCredentials(tokens);
+
+  // Auto-refresh if the access token is expired or about to expire (within 60s)
+  if (tokens.expiry_date && Date.now() > tokens.expiry_date - 60000) {
+    const { credentials } = await authClient.refreshAccessToken();
+    await supabase.from('users').update({
+      google_access_token: credentials.access_token,
+      google_token_expiry: credentials.expiry_date
+    }).eq('id', userId);
+    authClient.setCredentials(credentials);
+  }
+
+  return authClient;
+}
+
 // GET today's events
 app.get('/api/calendar/today', requireAuth, async (req, res) => {
   // Trigger a background sync first
