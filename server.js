@@ -90,13 +90,21 @@ app.get('/auth/callback', async (req, res) => {
       });
       if (signupError) throw signupError;
 
-      const { data: signinData } = await supabase.auth.signInWithPassword({
+      const { data: signinData, error: signinError } = await supabase.auth.signInWithPassword({
         email: profile.email,
         password: process.env.SUPABASE_USERS_SECRET + profile.id
       });
-      session = signinData?.session;
+      if (signinError || !signinData?.session) {
+        throw new Error(`Post-signup sign-in failed: ${signinError?.message || 'no session returned'}`);
+      }
+      session = signinData.session;
     } else {
       session = authData.session;
+    }
+
+    // Guard: prevents ?token=undefined reaching the frontend
+    if (!session?.access_token || !session?.refresh_token) {
+      throw new Error('Session tokens missing after authentication');
     }
 
     // Upsert user profile + store Google tokens in DB
