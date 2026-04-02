@@ -980,7 +980,7 @@ Travel events this week: ${weekEvents.filter(e=>e.is_travel).map(e=>e.title).joi
         'anthropic-version': '2023-06-01'
       },
       body: JSON.stringify({
-        model: 'claude-sonnet-4-20250514',
+        model: 'claude-sonnet-4-5',
         max_tokens: 1000,
         system: `You are an elite executive advisor and chief of staff. Be direct, concise, and actionable. No filler. Give specific, data-driven recommendations based on the executive's real schedule. For well-being topics, be empathetic but practical. Here is the executive's current context:\n\n${context}`,
         messages
@@ -1205,7 +1205,7 @@ Generate 4-8 proposals. Prioritize: fix overloaded days, add missing focus block
         'anthropic-version': '2023-06-01'
       },
       body: JSON.stringify({
-        model: 'claude-sonnet-4-20250514',
+        model: 'claude-sonnet-4-5',
         max_tokens: 2000,
         messages: [{ role: 'user', content: prompt }]
       })
@@ -1641,7 +1641,7 @@ Return ONLY valid JSON with this structure:
         'anthropic-version': '2023-06-01'
       },
       body: JSON.stringify({
-        model: 'claude-sonnet-4-20250514',
+        model: 'claude-sonnet-4-5',
         max_tokens: 1500,
         messages: [{ role: 'user', content: prompt }]
       })
@@ -1661,13 +1661,28 @@ Return ONLY valid JSON with this structure:
       console.error('[TRANSCRIPTION] Empty response from Anthropic. Full data:', JSON.stringify(data));
       return res.status(502).json({ error: 'AI returned an empty response. Please try again.' });
     }
-    raw = raw.replace(/```json|```/g, '').trim();
+
+    console.log('[TRANSCRIPTION] Raw AI response (first 500 chars):', raw.slice(0, 500));
+
+    // Strip markdown code fences — handle ```json, ```JSON, ``` on their own line
+    raw = raw.replace(/^```(?:json)?\s*/im, '').replace(/\s*```\s*$/im, '').trim();
+
+    // If response starts with a BOM or whitespace before {, strip it
+    const jsonStart = raw.indexOf('{');
+    const jsonEnd   = raw.lastIndexOf('}');
+    if (jsonStart > 0 || jsonEnd < raw.length - 1) {
+      console.log('[TRANSCRIPTION] Trimming non-JSON wrapper. jsonStart:', jsonStart, 'jsonEnd:', jsonEnd);
+      raw = raw.slice(jsonStart, jsonEnd + 1);
+    }
 
     let result;
-    try { result = JSON.parse(raw); }
-    catch (parseErr) {
-      console.error('[TRANSCRIPTION] JSON parse failed. Raw text:', raw.slice(0, 300));
-      result = { summary: raw, action_items: [], key_decisions: [] };
+    try {
+      result = JSON.parse(raw);
+      console.log('[TRANSCRIPTION] Parsed OK. Keys:', Object.keys(result));
+    } catch (parseErr) {
+      console.error('[TRANSCRIPTION] JSON parse failed:', parseErr.message, '| Raw:', raw.slice(0, 300));
+      // Last resort: return the raw text as the summary so the user sees something
+      result = { summary: raw || 'Could not parse AI response.', action_items: [], key_decisions: [] };
     }
 
     // Auto-save action items to DB (ones owned by "Me")
@@ -1797,7 +1812,7 @@ Interpret the command and return ONLY valid JSON:
         'anthropic-version': '2023-06-01'
       },
       body: JSON.stringify({
-        model: 'claude-sonnet-4-20250514',
+        model: 'claude-sonnet-4-5',
         max_tokens: 500,
         messages: [{ role: 'user', content: prompt }]
       })
