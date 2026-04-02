@@ -1661,7 +1661,7 @@ Return ONLY valid JSON with this structure:
     );
 
     if (myActions.length > 0) {
-      await supabase.from('action_items').insert(
+      const { error: aiErr } = await supabase.from('action_items').insert(
         myActions.map(a => ({
           user_id:  req.user.id,
           title:    `[${meeting_title || 'Meeting'}] ${a.task}`,
@@ -1670,6 +1670,7 @@ Return ONLY valid JSON with this structure:
           priority: a.priority || 'medium'
         }))
       );
+      if (aiErr) console.error('[TRANSCRIPTION] action_items insert failed (non-fatal):', aiErr.message);
     }
 
     // Save transcript and result to DB
