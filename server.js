@@ -1648,12 +1648,27 @@ Return ONLY valid JSON with this structure:
     });
 
     const data = await response.json();
-    let raw = data.content?.[0]?.text || '{}';
+
+    // Detect API-level errors (e.g. missing/invalid ANTHROPIC_API_KEY, quota exceeded)
+    if (!response.ok || data.type === 'error') {
+      const apiErr = data.error?.message || data.error?.type || `HTTP ${response.status}`;
+      console.error('[TRANSCRIPTION] Anthropic API error:', apiErr, '| Full response:', JSON.stringify(data));
+      return res.status(502).json({ error: `AI service error: ${apiErr}` });
+    }
+
+    let raw = data.content?.[0]?.text || '';
+    if (!raw) {
+      console.error('[TRANSCRIPTION] Empty response from Anthropic. Full data:', JSON.stringify(data));
+      return res.status(502).json({ error: 'AI returned an empty response. Please try again.' });
+    }
     raw = raw.replace(/```json|```/g, '').trim();
 
     let result;
     try { result = JSON.parse(raw); }
-    catch { result = { summary: raw, action_items: [], key_decisions: [] }; }
+    catch (parseErr) {
+      console.error('[TRANSCRIPTION] JSON parse failed. Raw text:', raw.slice(0, 300));
+      result = { summary: raw, action_items: [], key_decisions: [] };
+    }
 
     // Auto-save action items to DB (ones owned by "Me")
     const myActions = (result.action_items || []).filter(a =>
