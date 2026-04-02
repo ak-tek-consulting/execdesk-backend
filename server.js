@@ -1242,7 +1242,7 @@ Generate 4-8 proposals. Prioritize: fix overloaded days, add missing focus block
         created_at: new Date().toISOString()
       })),
       { onConflict: 'user_id,proposal_id' }
-    ).catch(() => {}); // table may not exist yet — non-fatal
+    ).then(()=>{},()=>{}); // table may not exist yet — non-fatal
 
     res.json({ proposals, analyzed_events: events.length });
   } catch (err) {
@@ -1380,7 +1380,7 @@ app.post('/api/agent/execute', requireAuth, async (req, res) => {
       .update({ status: 'executed', executed_at: new Date().toISOString() })
       .eq('user_id', req.user.id)
       .eq('proposal_id', proposal.id)
-      .catch(() => {});
+      .then(()=>{},()=>{});
 
     res.json({ results, executed: true });
 
@@ -1398,7 +1398,7 @@ app.post('/api/agent/dismiss', requireAuth, async (req, res) => {
     .update({ status: 'dismissed' })
     .eq('user_id', req.user.id)
     .eq('proposal_id', proposal_id)
-    .catch(() => {});
+    .then(()=>{},()=>{});
   res.json({ success: true });
 });
 
@@ -1683,7 +1683,7 @@ Return ONLY valid JSON with this structure:
       action_items:   result.action_items,
       key_decisions:  result.key_decisions,
       created_at:     new Date().toISOString()
-    }).catch(() => {}); // table may not exist yet
+    }).then(()=>{},()=>{}); // table may not exist yet
 
     res.json({
       ...result,
@@ -1925,7 +1925,7 @@ app.post('/auth/email/signup', async (req, res) => {
       await supabase.from('users').upsert({
         id: data.user.id, email, name,
         updated_at: new Date().toISOString()
-      }, { onConflict: 'id' }).catch(() => {});
+      }, { onConflict: 'id' }).then(()=>{},()=>{});
 
       return res.json({
         token:   data.session.access_token,
@@ -1968,7 +1968,7 @@ app.post('/auth/email/signin', async (req, res) => {
         id: data.user.id, email,
         name: data.user.user_metadata?.name || email.split('@')[0],
         updated_at: new Date().toISOString()
-      }, { onConflict: 'id' }).catch(() => {});
+      }, { onConflict: 'id' }).then(()=>{},()=>{});
     }
 
     res.json({
@@ -2014,8 +2014,8 @@ app.delete('/api/account', requireAuth, async (req, res) => {
     await supabase.from('action_items').delete().eq('user_id', userId);
     await supabase.from('goals').delete().eq('user_id', userId);
     await supabase.from('calendar_events').delete().eq('user_id', userId);
-    await supabase.from('agent_proposals').delete().eq('user_id', userId).catch(() => {});
-    await supabase.from('meeting_transcripts').delete().eq('user_id', userId).catch(() => {});
+    await supabase.from('agent_proposals').delete().eq('user_id', userId).then(()=>{},()=>{});
+    await supabase.from('meeting_transcripts').delete().eq('user_id', userId).then(()=>{},()=>{});
     await supabase.from('users').delete().eq('id', userId);
     // Delete Supabase Auth user (requires service role key)
     await supabase.auth.admin.deleteUser(userId);
